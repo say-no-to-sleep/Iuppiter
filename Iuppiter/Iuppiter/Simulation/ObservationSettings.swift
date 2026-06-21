@@ -1,5 +1,10 @@
 import Foundation
 
+enum PlanetariumLimits {
+    static let minZoom = 1.0
+    static let maxZoom = 2000.0
+}
+
 enum ObservationMode: String, CaseIterable, Identifiable, Sendable {
     case orbit
     case planetarium

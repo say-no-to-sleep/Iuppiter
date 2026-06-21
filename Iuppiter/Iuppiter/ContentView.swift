@@ -49,7 +49,7 @@ struct ContentView: View {
             },
             set: { newValue in
                 if observationMode == .planetarium {
-                    planetariumZoom = min(2000, max(1, newValue))
+                    planetariumZoom = min(PlanetariumLimits.maxZoom, max(PlanetariumLimits.minZoom, newValue))
                 } else {
                     cameraDistance = newValue
                 }
@@ -78,7 +78,7 @@ struct ContentView: View {
                         selectedBodyID: selectedBodyID,
                         selectBody: lockBody
                     )
-                    .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 360)
+                    .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 320)
                 } detail: {
                     viewportScene(isPhotoMode: false)
                         .toolbar {
@@ -109,7 +109,7 @@ struct ContentView: View {
                                 clearTargetLock: clearBodyLock,
                                 setPhotoMode: setPhotoMode
                             )
-                            .inspectorColumnWidth(min: 220, ideal: 260, max: 300)
+                            .inspectorColumnWidth(min: 180, ideal: 240, max: 280)
                         }
                 }
             }
@@ -159,6 +159,12 @@ struct ContentView: View {
                     lockBody(bodyID)
                 }
             }
+            if observationMode == .planetarium, !isPhotoMode {
+                PlanetariumCompassOverlay(headingDegrees: planetariumHeadingDegrees)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(16)
+                    .allowsHitTesting(false)
+            }
             #else
             Text("Metal renderer is currently enabled for macOS.")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -166,7 +172,7 @@ struct ContentView: View {
 
 
         }
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(minWidth: 360, minHeight: 420)
     }
 
     private func setSimulationDate(_ date: Date) {
@@ -217,6 +223,42 @@ struct ContentView: View {
 }
 
 #if os(macOS)
+private struct PlanetariumCompassOverlay: View {
+    let headingDegrees: Double
+
+    private var normalizedHeading: Double {
+        var value = headingDegrees.truncatingRemainder(dividingBy: 360)
+        if value < 0 {
+            value += 360
+        }
+        return value
+    }
+
+    private var cardinalDirection: String {
+        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        let index = Int((normalizedHeading / 45.0).rounded()) % directions.count
+        return directions[index]
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "location.north.circle.fill")
+                .font(.system(size: 52))
+                .symbolRenderingMode(.hierarchical)
+                .rotationEffect(.degrees(-normalizedHeading))
+                .animation(.easeOut(duration: 0.12), value: normalizedHeading)
+
+            Text("\(cardinalDirection) · \(Int(normalizedHeading.rounded()))°")
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+        }
+        .padding(10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Heading \(cardinalDirection), \(Int(normalizedHeading.rounded())) degrees")
+    }
+}
+
 private struct SolarSystemLabelsOverlay: View {
     let labels: [SolarSystemLabel]
     let selectBody: (String) -> Void
@@ -331,7 +373,7 @@ private struct InspectorControls: View {
             },
             set: { newValue in
                 if observationMode == .planetarium {
-                    cameraDistance = min(2000, max(1, pow(10, newValue)))
+                    cameraDistance = min(PlanetariumLimits.maxZoom, max(PlanetariumLimits.minZoom, pow(10, newValue)))
                 } else {
                     cameraDistance = pow(10, newValue)
                 }
@@ -340,7 +382,7 @@ private struct InspectorControls: View {
     }
 
     private var cameraControlRange: ClosedRange<Double> {
-        observationMode == .planetarium ? 0.0...log10(2000.0) : -5.0...2.4
+        observationMode == .planetarium ? 0.0...log10(PlanetariumLimits.maxZoom) : -5.0...2.4
     }
 
     var body: some View {

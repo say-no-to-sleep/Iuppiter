@@ -6,6 +6,7 @@ struct IuppiterApp: App {
         WindowGroup {
             ContentView()
         }
+        .defaultSize(width: 960, height: 640)
         .windowStyle(.hiddenTitleBar)
     }
 }

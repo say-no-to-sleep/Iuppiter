@@ -441,7 +441,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
     func zoomCamera(delta: Float) {
         let zoomFactor = exp(-delta * 0.012)
         if observationMode == .planetarium {
-            cameraDistance = min(400.0, max(1.0, cameraDistance / zoomFactor))
+            cameraDistance = min(Float(PlanetariumLimits.maxZoom), max(Float(PlanetariumLimits.minZoom), cameraDistance / zoomFactor))
         } else {
             cameraDistance = min(260.0, max(0.00001, cameraDistance * zoomFactor))
         }
@@ -469,7 +469,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
     }
 
     private func planetariumFovyRadians(for magnification: Float) -> Float {
-        let normalizedMagnification = min(400.0, max(1.0, magnification))
+        let normalizedMagnification = min(Float(PlanetariumLimits.maxZoom), max(Float(PlanetariumLimits.minZoom), magnification))
         let baseFovy = Float.pi / 2.0
         return max(degreesToRadians(0.08), baseFovy / normalizedMagnification)
     }
