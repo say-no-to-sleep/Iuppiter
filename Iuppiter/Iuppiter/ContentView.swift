@@ -49,7 +49,7 @@ struct ContentView: View {
             },
             set: { newValue in
                 if observationMode == .planetarium {
-                    planetariumZoom = min(400, max(1, newValue))
+                    planetariumZoom = min(2000, max(1, newValue))
                 } else {
                     cameraDistance = newValue
                 }
@@ -81,6 +81,17 @@ struct ContentView: View {
                     .navigationSplitViewColumnWidth(min: 240, ideal: 290, max: 360)
                 } detail: {
                     viewportScene(isPhotoMode: false)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button {
+                                    isInspectorPresented.toggle()
+                                } label: {
+                                    Image(systemName: "sidebar.trailing")
+                                }
+                                .help("Toggle Inspector")
+                                .accessibilityLabel("Toggle Inspector")
+                            }
+                        }
                         .inspector(isPresented: $isInspectorPresented) {
                             InspectorControls(
                                 selectedBody: selectedBody,
@@ -98,19 +109,8 @@ struct ContentView: View {
                                 clearTargetLock: clearBodyLock,
                                 setPhotoMode: setPhotoMode
                             )
-                            .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
+                            .inspectorColumnWidth(min: 220, ideal: 260, max: 300)
                         }
-                }
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            isInspectorPresented.toggle()
-                        } label: {
-                            Image(systemName: "sidebar.trailing")
-                        }
-                        .help("Toggle Inspector")
-                        .accessibilityLabel("Toggle Inspector")
-                    }
                 }
             }
         }
@@ -164,18 +164,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             #endif
 
-            if !isPhotoMode && observationMode == .planetarium {
-                VStack {
-                    HStack {
-                        Spacer()
-                        PlanetariumCompass(headingDegrees: planetariumHeadingDegrees)
-                            .padding(12)
-                            .controlGlass(cornerRadius: 12, interactive: false)
-                    }
-                    Spacer()
-                }
-                .padding(18)
-            }
+
         }
         .frame(minWidth: 720, minHeight: 520)
     }
@@ -305,6 +294,20 @@ private struct InspectorControls: View {
     let clearTargetLock: () -> Void
     let setPhotoMode: (Bool) -> Void
 
+    private var normalizedHeading: Double {
+        var value = planetariumHeadingDegrees.truncatingRemainder(dividingBy: 360)
+        if value < 0 {
+            value += 360
+        }
+        return value
+    }
+
+    private var cardinalDirection: String {
+        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        let index = Int((normalizedHeading / 45.0).rounded()) % directions.count
+        return directions[index]
+    }
+
     private var timeRateIndex: Binding<Double> {
         Binding(
             get: { Double(TimeRatePreset.closestIndex(to: timeRate)) },
@@ -328,7 +331,7 @@ private struct InspectorControls: View {
             },
             set: { newValue in
                 if observationMode == .planetarium {
-                    cameraDistance = min(400, max(1, pow(10, newValue)))
+                    cameraDistance = min(2000, max(1, pow(10, newValue)))
                 } else {
                     cameraDistance = pow(10, newValue)
                 }
@@ -337,7 +340,7 @@ private struct InspectorControls: View {
     }
 
     private var cameraControlRange: ClosedRange<Double> {
-        observationMode == .planetarium ? 0.0...log10(400.0) : -5.0...2.4
+        observationMode == .planetarium ? 0.0...log10(2000.0) : -5.0...2.4
     }
 
     var body: some View {
@@ -507,6 +510,17 @@ private struct InspectorControls: View {
 
             // Conditional Planetarium Location Controls
             if observationMode == .planetarium {
+                Section("Heading") {
+                    LabeledContent("Direction") {
+                        Text(cardinalDirection)
+                            .fontWeight(.semibold)
+                    }
+                    LabeledContent("Bearing") {
+                        Text("\(Int(normalizedHeading.rounded()))°")
+                            .monospacedDigit()
+                    }
+                }
+
                 Section("Location") {
                     PlanetariumLocationControls(location: $planetariumLocation)
                 }
@@ -575,58 +589,7 @@ private struct PlanetariumLocationControls: View {
     }
 }
 
-private struct PlanetariumCompass: View {
-    let headingDegrees: Double
 
-    private var normalizedHeading: Double {
-        var value = headingDegrees.truncatingRemainder(dividingBy: 360)
-        if value < 0 {
-            value += 360
-        }
-        return value
-    }
-
-    private var cardinalDirection: String {
-        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        let index = Int((normalizedHeading / 45.0).rounded()) % directions.count
-        return directions[index]
-    }
-
-    var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .strokeBorder(.secondary.opacity(0.45), lineWidth: 1)
-                    .background(Circle().fill(.black.opacity(0.18)))
-                Text("N")
-                    .font(.caption2.weight(.bold))
-                    .offset(y: -18)
-                Text("E")
-                    .font(.caption2.weight(.bold))
-                    .offset(x: 18)
-                Text("S")
-                    .font(.caption2.weight(.bold))
-                    .offset(y: 18)
-                Text("W")
-                    .font(.caption2.weight(.bold))
-                    .offset(x: -18)
-                Image(systemName: "location.north.fill")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.blue)
-                    .rotationEffect(.degrees(normalizedHeading))
-            }
-            .frame(width: 56, height: 56)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Looking \(cardinalDirection)")
-                    .font(.caption.weight(.semibold))
-                Text("\(Int(normalizedHeading.rounded())) degrees")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
 
 private struct CoordinateField: View {
     let title: String
