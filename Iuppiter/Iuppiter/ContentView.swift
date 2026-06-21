@@ -82,14 +82,6 @@ struct ContentView: View {
                 } detail: {
                     viewportScene(isPhotoMode: false)
                 }
-                .toolbar {
-                    ToolbarItem(placement: .navigation) {
-                        Button(action: toggleSidebar) {
-                            Image(systemName: "sidebar.leading")
-                        }
-                        .help("Toggle Sidebar")
-                    }
-                }
             }
         }
         .preferredColorScheme(.dark)
@@ -143,20 +135,6 @@ struct ContentView: View {
             #endif
 
             if !isPhotoMode {
-                VStack {
-                    HStack {
-                        SidebarToggleButton(
-                            isCollapsed: sidebarVisibility == .detailOnly,
-                            toggle: toggleSidebar
-                        )
-                        .padding(18)
-
-                        Spacer()
-                    }
-
-                    Spacer()
-                }
-
                 ViewportControls(
                     selectedBody: selectedBody,
                     cameraDistance: viewportCameraDistance,
@@ -296,22 +274,7 @@ private struct PhotoModeToolbar: View {
     }
 }
 
-private struct SidebarToggleButton: View {
-    let isCollapsed: Bool
-    let toggle: () -> Void
 
-    var body: some View {
-        Button(action: toggle) {
-            Image(systemName: isCollapsed ? "sidebar.leading" : "sidebar.left")
-                .font(.system(size: 15, weight: .semibold))
-                .frame(width: 34, height: 34)
-        }
-        .buttonStyle(.plain)
-        .controlGlass(cornerRadius: 10, interactive: true)
-        .help(isCollapsed ? "Show sidebar" : "Hide sidebar")
-        .accessibilityLabel(isCollapsed ? "Show sidebar" : "Hide sidebar")
-    }
-}
 
 private struct CollapsedControlsButton: View {
     let expand: () -> Void
