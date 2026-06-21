@@ -82,6 +82,19 @@ struct ContentView: View {
                 } detail: {
                     viewportScene(isPhotoMode: false)
                 }
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            withAnimation(.smooth(duration: 0.18)) {
+                                isControlPanelCollapsed.toggle()
+                            }
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                        }
+                        .help("Toggle Controls Panel")
+                        .accessibilityLabel("Toggle Controls Panel")
+                    }
+                }
             }
         }
         .preferredColorScheme(.dark)
@@ -156,11 +169,15 @@ struct ContentView: View {
                 .opacity(isControlPanelCollapsed ? 0 : 1)
                 .allowsHitTesting(!isControlPanelCollapsed)
 
-                if isControlPanelCollapsed {
-                    CollapsedControlsButton {
-                        withAnimation(.smooth(duration: 0.18)) {
-                            isControlPanelCollapsed = false
+                if observationMode == .planetarium {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            PlanetariumCompass(headingDegrees: planetariumHeadingDegrees)
+                                .padding(12)
+                                .controlGlass(cornerRadius: 12, interactive: false)
                         }
+                        Spacer()
                     }
                     .padding(18)
                 }
@@ -276,21 +293,7 @@ private struct PhotoModeToolbar: View {
 
 
 
-private struct CollapsedControlsButton: View {
-    let expand: () -> Void
 
-    var body: some View {
-        Button(action: expand) {
-            Label("Controls", systemImage: "slider.horizontal.3")
-                .font(.callout.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-        }
-        .buttonStyle(.plain)
-        .controlGlass(cornerRadius: 12, interactive: true)
-        .accessibilityLabel("Show controls")
-    }
-}
 
 private struct ViewportControls: View {
     let selectedBody: NativeCelestialBody
@@ -308,14 +311,6 @@ private struct ViewportControls: View {
     @Binding var isCollapsed: Bool
     let clearTargetLock: () -> Void
     let setPhotoMode: (Bool) -> Void
-
-    private var actionColumns: [GridItem] {
-        [
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10)
-        ]
-    }
 
     private var timeRateIndex: Binding<Double> {
         Binding(
@@ -354,6 +349,7 @@ private struct ViewportControls: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            // Header
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Controls")
@@ -370,160 +366,192 @@ private struct ViewportControls: View {
                         isCollapsed = true
                     }
                 } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 28, height: 28)
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                        .frame(width: 20, height: 20)
+                        .background(Circle().fill(.gray.opacity(0.18)))
                 }
                 .buttonStyle(.plain)
                 .help("Collapse controls")
                 .accessibilityLabel("Collapse controls")
             }
 
-            LabeledContent("Mode") {
-                Picker("Mode", selection: $observationMode) {
-                    ForEach(ObservationMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 220)
-            }
-
+            // Mode Details (e.g. Earth, Radius)
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(observationMode == .planetarium ? "Planetarium" : selectedBody.name)
-                        .font(.headline.weight(.semibold))
+                        .font(.title3.weight(.bold))
                     Text(observationMode == .planetarium ? planetariumLocation.name : "Radius \(selectedBody.radiusKilometers.formatted()) km")
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer(minLength: 24)
 
                 Text(selectedBody.textureName.isEmpty ? "procedural" : selectedBody.textureName)
-                    .font(.caption2.monospaced())
+                    .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
+            .padding(.vertical, 4)
 
-            LabeledContent(observationMode == .planetarium ? "Zoom" : "Camera") {
-                HStack(spacing: 10) {
-                    Slider(value: cameraControlValue, in: cameraControlRange)
-                        .frame(width: observationMode == .planetarium ? 140 : 180)
-
-                    if observationMode == .planetarium {
-                        Text("\(Int(cameraDistance.rounded()))x")
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .frame(width: 48, alignment: .trailing)
+            // Settings Grid (HIG Aligned)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                GridRow {
+                    Text("Mode")
+                        .gridColumnAlignment(.trailing)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    
+                    Picker("Mode", selection: $observationMode) {
+                        ForEach(ObservationMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 220)
+                }
+                
+                GridRow {
+                    Text(observationMode == .planetarium ? "Zoom" : "Camera")
+                        .gridColumnAlignment(.trailing)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    
+                    HStack(spacing: 8) {
+                        Slider(value: cameraControlValue, in: cameraControlRange)
+                            .frame(width: 140)
+                        
+                        if observationMode == .planetarium {
+                            Text("\(Int(cameraDistance.rounded()))x")
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .frame(width: 48, alignment: .leading)
+                        }
                     }
                 }
-            }
-
-            LabeledContent("Time Rate") {
-                if isLiveView {
-                    Text("Live")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.green)
-                        .frame(width: 220, alignment: .trailing)
-                } else {
-                    HStack(spacing: 10) {
-                        Slider(
-                            value: timeRateIndex,
-                            in: 0...Double(TimeRatePreset.all.count - 1),
-                            step: 1
-                        )
-                        .frame(width: 140)
-
-                        Text(TimeRatePreset.label(for: timeRate))
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .frame(width: 70, alignment: .trailing)
+                
+                GridRow {
+                    Text("Time Rate")
+                        .gridColumnAlignment(.trailing)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    
+                    HStack(spacing: 8) {
+                        if isLiveView {
+                            Text("Live")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.green)
+                                .frame(width: 140, alignment: .leading)
+                        } else {
+                            Slider(
+                                value: timeRateIndex,
+                                in: 0...Double(TimeRatePreset.all.count - 1),
+                                step: 1
+                            )
+                            .frame(width: 140)
+                            
+                            Text(TimeRatePreset.label(for: timeRate))
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .frame(width: 70, alignment: .leading)
+                        }
                     }
                 }
-            }
-
-            LabeledContent("Date & Time") {
-                DatePicker(
-                    "Date & Time",
-                    selection: $simulationDate,
-                    displayedComponents: [.date, .hourAndMinute]
-                )
-                .labelsHidden()
-                .frame(width: 220)
+                
+                GridRow {
+                    Text("Date & Time")
+                        .gridColumnAlignment(.trailing)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    
+                    DatePicker(
+                        "Date & Time",
+                        selection: $simulationDate,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .labelsHidden()
+                    .frame(width: 220)
+                }
             }
 
             Text(simulationDate.formatted(date: .abbreviated, time: .standard))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 
-            LazyVGrid(columns: actionColumns, alignment: .leading, spacing: 10) {
-                Button {
-                    isPaused.toggle()
-                } label: {
-                    Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
-                        .frame(maxWidth: .infinity)
-                }
-
-                Button {
-                    timeRate = TimeRatePreset.all[0].secondsPerSecond
-                    isPaused = false
-                } label: {
-                    Label("1 s/s", systemImage: "clock.arrow.circlepath")
-                        .frame(maxWidth: .infinity)
-                }
-
-                Button {
-                    simulationDate = Date()
-                } label: {
-                    Label("Now", systemImage: "calendar")
-                        .frame(maxWidth: .infinity)
-                }
-
-                Button {
-                    isLiveView.toggle()
-                    if isLiveView {
-                        isPaused = false
+            // Buttons (HIG Aligned)
+            HStack(spacing: 12) {
+                ControlGroup {
+                    Button {
+                        isPaused.toggle()
+                    } label: {
+                        Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
                     }
-                } label: {
-                    Label(isLiveView ? "Live: On" : "Live View", systemImage: "livephoto")
-                        .frame(maxWidth: .infinity)
+                    .help(isPaused ? "Resume simulation" : "Pause simulation")
+                    
+                    Button {
+                        timeRate = TimeRatePreset.all[0].secondsPerSecond
+                        isPaused = false
+                    } label: {
+                        Label("1 s/s", systemImage: "clock.arrow.circlepath")
+                    }
+                    .help("Reset simulation speed to 1 s/s")
+                    
+                    Button {
+                        simulationDate = Date()
+                    } label: {
+                        Label("Now", systemImage: "calendar")
+                    }
+                    .help("Set simulation date to current time")
+                    
+                    Button {
+                        isLiveView.toggle()
+                        if isLiveView {
+                            isPaused = false
+                        }
+                    } label: {
+                        Label("Live", systemImage: "livephoto")
+                    }
+                    .help("Sync to real-time clock")
                 }
-                .tint(isLiveView ? .green : nil)
-
-                Button {
-                    setPhotoMode(true)
-                } label: {
-                    Label("Photo", systemImage: "camera.viewfinder")
-                        .frame(maxWidth: .infinity)
+                .controlGroupStyle(.navigation)
+                
+                ControlGroup {
+                    Button {
+                        setPhotoMode(true)
+                    } label: {
+                        Label("Photo", systemImage: "camera.viewfinder")
+                    }
+                    .help("Enter photo mode")
+                    
+                    Button {
+                        photoCaptureTrigger.toggle()
+                    } label: {
+                        Label("Save", systemImage: "square.and.arrow.down")
+                    }
+                    .help("Save snapshot of current view")
                 }
-                .keyboardShortcut("f", modifiers: [.command, .shift])
-
-                Button {
-                    photoCaptureTrigger.toggle()
-                } label: {
-                    Label("Save", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity)
-                }
-
+                .controlGroupStyle(.navigation)
+                
                 Button {
                     clearTargetLock()
                 } label: {
                     Label("Clear Lock", systemImage: "scope")
-                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
                 .disabled(!isTargetLocked)
+                .help("Clear lock on selected celestial body")
             }
-            .buttonStyle(.bordered)
 
-            HStack(spacing: 14) {
+            // Checkboxes
+            HStack(spacing: 16) {
                 Toggle("Orbit Lines", isOn: $options.showOrbits)
                 Toggle("Nametags", isOn: $options.showLabels)
             }
             .toggleStyle(.checkbox)
             .font(.caption.weight(.semibold))
 
+            // Conditional Planetarium Controls
             if observationMode == .planetarium {
-                Divider()
-                PlanetariumCompass(headingDegrees: planetariumHeadingDegrees)
                 Divider()
                 PlanetariumLocationControls(location: $planetariumLocation)
             } else if let orbitText = selectedBody.orbitSummary {
@@ -647,8 +675,6 @@ private struct PlanetariumCompass: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-
-            Spacer(minLength: 0)
         }
     }
 }
