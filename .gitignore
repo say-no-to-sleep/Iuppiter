@@ -3,3 +3,8 @@ DerivedData/
 build/
 *.xcuserstate
 xcuserdata/
+__pycache__/
+*.pyc
+*.profraw
+*.prt
+Iuppiter-Obsidian/

@@ -25,7 +25,7 @@ struct NativeOrbitPath {
     let inclination: Float
     let longitudeOfAscendingNode: Float
     let argumentOfPeriapsis: Float
-    let referencePlane: String
+    let referencePlane: NativeReferencePlane
     let parentAxialTiltDegrees: Float
     let currentEccentricAnomaly: Float
     let color: SIMD4<Float>
@@ -36,6 +36,61 @@ struct SolarSystemSnapshot {
     let orbitPaths: [NativeOrbitPath]
     let selectedState: NativeBodyRenderState
     let sunPosition: SIMD3<Float>
+}
+
+enum OrbitGeometry {
+    static func offset(
+        semiMajorAxis: Double,
+        eccentricity: Double,
+        inclinationDegrees: Double,
+        longitudeOfAscendingNodeDegrees: Double,
+        argumentOfPeriapsisDegrees: Double,
+        eccentricAnomaly: Double,
+        referencePlane: NativeReferencePlane,
+        parentAxialTiltDegrees: Float
+    ) -> SIMD3<Double> {
+        // 1. Orbital plane coordinates (x towards periapsis)
+        let xp = semiMajorAxis * (cos(eccentricAnomaly) - eccentricity)
+        let zp = semiMajorAxis * sqrt(1.0 - eccentricity * eccentricity) * sin(eccentricAnomaly)
+        let flat = SIMD3<Double>(xp, 0.0, zp)
+
+        // 2. Rotate by argument of periapsis in plane (around Y-axis)
+        let argPeriRad = argumentOfPeriapsisDegrees * .pi / 180.0
+        let rotatedInPlane = rotateVector(flat, radians: -argPeriRad, axis: SIMD3<Double>(0, 1, 0))
+
+        // 3. Tilt by inclination around X-axis
+        let inclRad = inclinationDegrees * .pi / 180.0
+        let tilted = rotateVector(rotatedInPlane, radians: inclRad, axis: SIMD3<Double>(1, 0, 0))
+
+        // 4. Rotate by longitude of ascending node around Y-axis
+        let nodeRad = longitudeOfAscendingNodeDegrees * .pi / 180.0
+        let positioned = rotateVector(tilted, radians: -nodeRad, axis: SIMD3<Double>(0, 1, 0))
+
+        // 5. If equatorial-referenced, tilt by the parent planet's axial tilt.
+        let finalOffset: SIMD3<Double>
+        if referencePlane == .body {
+            let parentTiltRad = Double(parentAxialTiltDegrees) * .pi / 180.0
+            finalOffset = rotateVector(positioned, radians: parentTiltRad, axis: SIMD3<Double>(1, 0, 0))
+        } else {
+            finalOffset = positioned
+        }
+
+        return displayCoordinateOffset(finalOffset)
+    }
+
+    static func displayCoordinateOffset(_ offset: SIMD3<Double>) -> SIMD3<Double> {
+        // Horizons/J2000 vectors are right-handed, but the app's top-down camera
+        // convention expects the horizontal orbital axis mirrored. Do this in
+        // world space so textures and pointer controls are not screen-mirrored.
+        SIMD3<Double>(-offset.x, offset.y, offset.z)
+    }
+
+    static func rotateVector(_ vector: SIMD3<Double>, radians: Double, axis: SIMD3<Double>) -> SIMD3<Double> {
+        let axis = normalize(axis)
+        let cosAngle = cos(radians)
+        let sinAngle = sin(radians)
+        return vector * cosAngle + cross(axis, vector) * sinAngle + axis * dot(axis, vector) * (1.0 - cosAngle)
+    }
 }
 
 enum SolarSystemSimulation {
@@ -83,12 +138,7 @@ enum SolarSystemSimulation {
         var plutoCharonEccentricAnomaly: Float?
         var plutoCharonSceneSeparation: Float?
 
-        let visibleBodies = NativeBodyCatalog.bodies.filter { body in
-            if body.kind != .moon { return true }
-            if !options.showMoons { return false }
-            if !options.showProcedural && body.assetTier == "procedural" { return false }
-            return options.showMinorMoons || body.isMajor || body.parentID == "earth"
-        }
+        let visibleBodies = NativeBodyCatalog.visibleBodies(options: options)
 
         for body in visibleBodies {
             let nominalParentPosition = body.parentID.flatMap { positionsByID[$0] } ?? .zero
@@ -270,49 +320,20 @@ enum SolarSystemSimulation {
             E = E - (E - ecc * sin(E) - meanAnomaly) / (1.0 - ecc * cos(E))
         }
 
-        // 1. Orbital plane coordinates (x towards periapsis)
-        let xp = Double(semiMajorAxis) * (cos(E) - ecc)
-        let zp = Double(semiMajorAxis) * sqrt(1.0 - ecc * ecc) * sin(E)
-        let flat = SIMD3<Double>(xp, 0.0, zp)
-
-        // 2. Rotate by argument of periapsis in plane (around Y-axis)
-        let argPeriRad = body.argumentOfPeriapsisDegrees * .pi / 180.0
-        let rotatedInPlane = rotateVectorD(flat, radians: -argPeriRad, axis: SIMD3<Double>(0, 1, 0))
-
-        // 3. Tilt by inclination around X-axis
-        let inclRad = body.inclinationDegrees * .pi / 180.0
-        let tilted = rotateVectorD(rotatedInPlane, radians: inclRad, axis: SIMD3<Double>(1, 0, 0))
-
-        // 4. Rotate by longitude of ascending node around Y-axis
-        let nodeRad = body.longitudeOfAscendingNodeDegrees * .pi / 180.0
-        let positioned = rotateVectorD(tilted, radians: -nodeRad, axis: SIMD3<Double>(0, 1, 0))
-
-        // 5. If equatorial-referenced (BODY), tilt by the parent planet's axial tilt around the X-axis
-        var finalOffset = positioned
-        if body.referencePlane == "BODY", let parent = parentBody {
-            let parentTiltRad = Double(parent.axialTiltDegrees) * .pi / 180.0
-            finalOffset = rotateVectorD(positioned, radians: parentTiltRad, axis: SIMD3<Double>(1, 0, 0))
-        }
-
-        let displayOffset = displayCoordinateOffset(finalOffset)
+        let displayOffset = OrbitGeometry.offset(
+            semiMajorAxis: Double(semiMajorAxis),
+            eccentricity: ecc,
+            inclinationDegrees: body.inclinationDegrees,
+            longitudeOfAscendingNodeDegrees: body.longitudeOfAscendingNodeDegrees,
+            argumentOfPeriapsisDegrees: body.argumentOfPeriapsisDegrees,
+            eccentricAnomaly: E,
+            referencePlane: body.referencePlane,
+            parentAxialTiltDegrees: parentBody?.axialTiltDegrees ?? 0
+        )
         return (
             offset: SIMD3<Float>(Float(displayOffset.x), Float(displayOffset.y), Float(displayOffset.z)),
             eccentricAnomaly: Float(E)
         )
-    }
-
-    private static func displayCoordinateOffset(_ offset: SIMD3<Double>) -> SIMD3<Double> {
-        // Horizons/J2000 vectors are right-handed, but the app's top-down camera
-        // convention expects the horizontal orbital axis mirrored. Do this in
-        // world space so textures and pointer controls are not screen-mirrored.
-        SIMD3<Double>(-offset.x, offset.y, offset.z)
-    }
-
-    private static func rotateVectorD(_ vector: SIMD3<Double>, radians: Double, axis: SIMD3<Double>) -> SIMD3<Double> {
-        let axis = normalize(axis)
-        let cosAngle = cos(radians)
-        let sinAngle = sin(radians)
-        return vector * cosAngle + cross(axis, vector) * sinAngle + axis * dot(axis, vector) * (1.0 - cosAngle)
     }
 
     private static func sceneRadius(for body: NativeCelestialBody) -> Float {
@@ -398,7 +419,7 @@ enum SolarSystemSimulation {
         }
 
         let parentDirection = toParent / distance
-        let untiltedParentDirection = rotateVectorD(
+        let untiltedParentDirection = OrbitGeometry.rotateVector(
             parentDirection,
             radians: -Double(body.axialTiltDegrees) * .pi / 180.0,
             axis: SIMD3<Double>(1, 0, 0)
@@ -432,7 +453,7 @@ enum SolarSystemSimulation {
         }
 
         let sunDirection = earthToSun / distance
-        let untiltedSun = rotateVectorD(
+        let untiltedSun = OrbitGeometry.rotateVector(
             sunDirection,
             radians: -Double(body.axialTiltDegrees) * .pi / 180.0,
             axis: SIMD3<Double>(1, 0, 0)

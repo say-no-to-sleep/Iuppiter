@@ -157,26 +157,6 @@ extension Bundle {
     }
 }
 
-enum SamplerCache {
-    private static var sampler: MTLSamplerState?
-
-    static func linearSampler(device: MTLDevice) -> MTLSamplerState? {
-        if let sampler {
-            return sampler
-        }
-
-        let descriptor = MTLSamplerDescriptor()
-        descriptor.minFilter = .linear
-        descriptor.magFilter = .linear
-        descriptor.mipFilter = .linear
-        descriptor.sAddressMode = .repeat
-        descriptor.tAddressMode = .clampToEdge
-        let state = device.makeSamplerState(descriptor: descriptor)
-        sampler = state
-        return state
-    }
-}
-
 func rotateVector(_ vector: SIMD3<Float>, radians: Float, axis: SIMD3<Float>) -> SIMD3<Float> {
     let axis = normalize(axis)
     let cosAngle = cos(radians)

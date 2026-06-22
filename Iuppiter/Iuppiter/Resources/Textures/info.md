@@ -6,7 +6,6 @@ These files are distributed by Solar System Scope under the Creative Commons Att
 - HighRes/8k_sun.jpg: https://www.solarsystemscope.com/textures/download/8k_sun.jpg
 - HighRes/8k_mercury.jpg: https://www.solarsystemscope.com/textures/download/8k_mercury.jpg
 - HighRes/4k_venus_atmosphere.jpg: https://www.solarsystemscope.com/textures/download/4k_venus_atmosphere.jpg
-- HighRes/8k_earth_daymap.jpg: https://www.solarsystemscope.com/textures/download/8k_earth_daymap.jpg
 - Maps/8k_earth_nightmap.jpg: https://www.solarsystemscope.com/textures/download/8k_earth_nightmap.jpg
 - HighRes/8k_moon.jpg: https://www.solarsystemscope.com/textures/download/8k_moon.jpg
 - HighRes/8k_mars.jpg: https://www.solarsystemscope.com/textures/download/8k_mars.jpg
@@ -24,11 +23,11 @@ Physically accurate Earth texture:
 
 Credit: NASA Earth Observations / Blue Marble Next Generation. Blue Marble Next Generation data courtesy of Reto Stockli (NASA/GSFC) and NASA's Earth Observatory.
 
-Live Earth cloud and specular maps:
+Live Earth imagery and specular maps:
 
-The app fetches these live 8192x4096 maps at runtime and refreshes them every 60 seconds while Earth is being rendered.
+The app fetches live Earth true-color imagery from NASA GIBS at runtime. The cloud-covered true-color base map is requested daily and the specular map refreshes while Earth is being rendered.
 
-- Clouds: https://clouds.matteason.co.uk/images/8192x4096/clouds-alpha.png
+- True color: https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi
 - Specular: https://clouds.matteason.co.uk/images/8192x4096/specular.jpg
 - Original live cloud service: https://github.com/matteason/live-cloud-maps
 

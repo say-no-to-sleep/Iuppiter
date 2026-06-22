@@ -1,70 +1,57 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @State private var selectedBodyID = NativeBodyCatalog.defaultSelection.id
-    @State private var lockedBodyID: String? = NativeBodyCatalog.defaultSelection.id
-    @State private var cameraDistance: Double = 72.0
-    @State private var planetariumZoom: Double = 1.0
-    @State private var timeRate: Double = TimeRatePreset.all[0].secondsPerSecond
-    @State private var isPaused = false
-    @State private var isLiveView = true
-    @State private var simulationDate = Date()
-    @State private var dateSelectionTrigger = false
-    @State private var photoCaptureTrigger = false
-    @State private var options = NativeRenderOptions()
-    @State private var isPhotoMode = false
-    @State private var observationMode: ObservationMode = .orbit
-    @State private var planetariumLocation = PlanetariumLocation.waterloo
-    @State private var planetariumHeadingDegrees = 0.0
+    @State private var session = ObservationSession()
     @State private var sidebarVisibility = NavigationSplitViewVisibility.doubleColumn
     @State private var isInspectorPresented = true
+    @State private var photoExportDocument = PNGPhotoDocument()
+    @State private var isPhotoExporterPresented = false
+    @State private var photoExportFilename = "Iuppiter.png"
+    @State private var rendererAlert: RendererAlert?
     #if os(macOS)
     @State private var viewport = SolarSystemViewport()
     #endif
 
     private var selectedBody: NativeCelestialBody {
-        NativeBodyCatalog.body(withID: selectedBodyID) ?? NativeBodyCatalog.defaultSelection
+        session.selectedBody
     }
 
     private var visibleBodies: [NativeCelestialBody] {
-        NativeBodyCatalog.bodies.filter { body in
-            if body.kind != .moon { return true }
-            if !options.showMoons { return false }
-            if !options.showProcedural && body.assetTier == "procedural" { return false }
-            return options.showMinorMoons || body.isMajor || body.parentID == "earth"
-        }
+        session.visibleBodies
     }
 
     private var simulationDateSelection: Binding<Date> {
         Binding(
-            get: { simulationDate },
-            set: { setSimulationDate($0) }
+            get: { session.simulationDate },
+            set: { session.setSimulationDate($0) }
         )
     }
 
     private var viewportCameraDistance: Binding<Double> {
         Binding(
-            get: {
-                observationMode == .planetarium ? planetariumZoom : cameraDistance
-            },
-            set: { newValue in
-                if observationMode == .planetarium {
-                    planetariumZoom = min(PlanetariumLimits.maxZoom, max(PlanetariumLimits.minZoom, newValue))
-                } else {
-                    cameraDistance = newValue
-                }
-            }
+            get: { session.viewportCameraDistance },
+            set: { session.viewportCameraDistance = $0 }
+        )
+    }
+
+    private var sidebarSelection: Binding<String> {
+        Binding(
+            get: { session.selectedBodyID },
+            set: { session.lockBody($0) }
         )
     }
 
     var body: some View {
+        @Bindable var session = session
+
         Group {
-            if isPhotoMode {
+            if session.isPhotoMode {
                 ZStack(alignment: .topTrailing) {
                     viewportScene(isPhotoMode: true)
 
                     PhotoModeToolbar(
-                        capturePhoto: capturePhoto,
+                        capturePhoto: session.capturePhoto,
                         exitPhotoMode: { setPhotoMode(false) }
                     )
                     .padding(18)
@@ -73,94 +60,106 @@ struct ContentView: View {
                 .ignoresSafeArea()
             } else {
                 NavigationSplitView(columnVisibility: $sidebarVisibility) {
-                    SidebarViewController(
+                    BodiesSidebar(
                         bodies: visibleBodies,
-                        selectedBodyID: selectedBodyID,
-                        selectBody: lockBody
+                        selectedBodyID: sidebarSelection
                     )
                     .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 320)
                 } detail: {
                     viewportScene(isPhotoMode: false)
                         .toolbar {
-                            ToolbarItem(placement: .confirmationAction) {
+                            ToolbarItem(placement: .primaryAction) {
                                 Button {
                                     isInspectorPresented.toggle()
                                 } label: {
-                                    Image(systemName: "sidebar.trailing")
+                                    Label("Inspector", systemImage: "sidebar.trailing")
                                 }
                                 .help("Toggle Inspector")
-                                .accessibilityLabel("Toggle Inspector")
+                                .keyboardShortcut("i", modifiers: [.command, .option])
                             }
                         }
                         .inspector(isPresented: $isInspectorPresented) {
                             InspectorControls(
                                 selectedBody: selectedBody,
                                 cameraDistance: viewportCameraDistance,
-                                timeRate: $timeRate,
-                                isPaused: $isPaused,
-                                isLiveView: $isLiveView,
+                                timeRate: $session.timeRate,
+                                isPaused: $session.isPaused,
+                                isLiveView: $session.isLiveView,
                                 simulationDate: simulationDateSelection,
-                                photoCaptureTrigger: $photoCaptureTrigger,
-                                observationMode: $observationMode,
-                                planetariumLocation: $planetariumLocation,
-                                planetariumHeadingDegrees: planetariumHeadingDegrees,
-                                options: $options,
-                                isTargetLocked: lockedBodyID != nil,
-                                clearTargetLock: clearBodyLock,
+                                photoCaptureTrigger: $session.photoCaptureTrigger,
+                                observationMode: $session.observationMode,
+                                planetariumLocation: $session.planetariumLocation,
+                                options: $session.options,
+                                isTargetLocked: session.lockedBodyID != nil,
+                                clearTargetLock: session.clearBodyLock,
                                 setPhotoMode: setPhotoMode
                             )
                             .inspectorColumnWidth(min: 180, ideal: 240, max: 280)
+                            .formStyle(.grouped)
                         }
                 }
             }
         }
         .preferredColorScheme(.dark)
         .onChange(of: visibleBodies) { _, newValue in
-            // Fallback selection if current selection becomes hidden
-            if !newValue.contains(where: { $0.id == selectedBodyID }) {
-                selectedBodyID = newValue.first?.id ?? NativeBodyCatalog.defaultSelection.id
+            session.handleVisibleBodiesChanged(newValue)
+        }
+        .onChange(of: session.observationMode) { _, newValue in
+            session.handleObservationModeChanged(newValue)
+        }
+        .fileExporter(
+            isPresented: $isPhotoExporterPresented,
+            document: photoExportDocument,
+            contentType: .png,
+            defaultFilename: photoExportFilename
+        ) { result in
+            if case .failure(let error) = result {
+                reportRendererError("Photo export failed: \(error.localizedDescription)")
             }
         }
-        .onChange(of: observationMode) { _, newValue in
-            if newValue == .planetarium {
-                selectedBodyID = "earth"
-                lockedBodyID = nil
-            } else if lockedBodyID == nil {
-                selectedBodyID = NativeBodyCatalog.defaultSelection.id
-            }
+        .alert(item: $rendererAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("OK"))
+            )
         }
     }
 
     @ViewBuilder
     private func viewportScene(isPhotoMode: Bool) -> some View {
+        @Bindable var session = session
+
         ZStack(alignment: .bottomLeading) {
             #if os(macOS)
                 MetalSolarSystemView(
                     selectedBody: selectedBody,
-                    lockedBodyID: lockedBodyID,
+                    lockedBodyID: session.lockedBodyID,
                     cameraDistance: viewportCameraDistance,
-                    timeRate: timeRate,
-                    isPaused: isPaused,
-                    isLiveView: $isLiveView,
-                    simulationDate: $simulationDate,
-                    dateSelectionTrigger: $dateSelectionTrigger,
-                    planetariumHeadingDegrees: $planetariumHeadingDegrees,
-                    photoCaptureTrigger: $photoCaptureTrigger,
+                    timeRate: session.timeRate,
+                    isPaused: session.isPaused,
+                    isLiveView: $session.isLiveView,
+                    simulationDate: $session.simulationDate,
+                    dateSelectionTrigger: $session.dateSelectionTrigger,
+                    planetariumHeadingDegrees: $session.planetariumHeadingDegrees,
+                    photoCaptureTrigger: $session.photoCaptureTrigger,
                     viewport: viewport,
-                    options: isPhotoMode ? options.photoModeOptions : options,
-                    observationMode: observationMode,
-                    planetariumLocation: planetariumLocation,
+                    options: isPhotoMode ? session.options.photoModeOptions : session.options,
+                    observationMode: session.observationMode,
+                    planetariumLocation: session.planetariumLocation,
                     isPhotoMode: isPhotoMode,
-                    selectBodyFromViewport: handleViewportPick,
+                    selectBodyFromViewport: session.handleViewportPick,
+                    exportPhoto: exportPhoto,
+                    reportRendererError: reportRendererError,
                     exitPhotoMode: { setPhotoMode(false) }
                 )
             if !isPhotoMode {
                 SolarSystemLabelsOverlay(labels: viewport.labels) { bodyID in
-                    lockBody(bodyID)
+                    session.lockBody(bodyID)
                 }
             }
-            if observationMode == .planetarium, !isPhotoMode {
-                PlanetariumCompassOverlay(headingDegrees: planetariumHeadingDegrees)
+            if session.observationMode == .planetarium, !isPhotoMode {
+                PlanetariumCompassOverlay(headingDegrees: session.planetariumHeadingDegrees)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(16)
                     .allowsHitTesting(false)
@@ -175,75 +174,57 @@ struct ContentView: View {
         .frame(minWidth: 360, minHeight: 420)
     }
 
-    private func setSimulationDate(_ date: Date) {
-        simulationDate = date
-        dateSelectionTrigger.toggle()
-        isLiveView = false
-    }
-
-    private func lockBody(_ bodyID: String) {
-        guard NativeBodyCatalog.body(withID: bodyID) != nil else {
-            return
-        }
-        selectedBodyID = bodyID
-        lockedBodyID = observationMode == .planetarium && bodyID == "earth" ? nil : bodyID
-    }
-
-    private func handleViewportPick(_ bodyID: String?) {
-        if let bodyID {
-            lockBody(bodyID)
-        } else {
-            clearBodyLock()
-        }
-    }
-
-    private func clearBodyLock() {
-        lockedBodyID = nil
-        selectedBodyID = observationMode == .planetarium ? "earth" : NativeBodyCatalog.defaultSelection.id
-    }
-
-    private func toggleSidebar() {
-        withAnimation(.smooth(duration: 0.18)) {
-            sidebarVisibility = sidebarVisibility == .detailOnly ? .doubleColumn : .detailOnly
-        }
+    private func exportPhoto(_ data: Data) {
+        photoExportDocument = PNGPhotoDocument(data: data)
+        photoExportFilename = Self.photoExportFilename()
+        isPhotoExporterPresented = true
     }
 
     private func setPhotoMode(_ enabled: Bool) {
-        guard isPhotoMode != enabled else {
-            return
-        }
         withAnimation(.easeInOut(duration: 0.18)) {
-            isPhotoMode = enabled
+            session.setPhotoMode(enabled)
         }
     }
 
-    private func capturePhoto() {
-        photoCaptureTrigger.toggle()
+    private func reportRendererError(_ message: String) {
+        guard rendererAlert?.message != message else {
+            return
+        }
+        rendererAlert = RendererAlert(message: message)
     }
+
+    private static func photoExportFilename() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return "Iuppiter-\(formatter.string(from: Date())).png"
+    }
+}
+
+private struct RendererAlert: Identifiable {
+    let id = UUID()
+    let title = "Renderer Issue"
+    let message: String
 }
 
 #if os(macOS)
 private struct PlanetariumCompassOverlay: View {
     let headingDegrees: Double
 
+    @ScaledMetric(relativeTo: .title) private var iconSize = 52
+
     private var normalizedHeading: Double {
-        var value = headingDegrees.truncatingRemainder(dividingBy: 360)
-        if value < 0 {
-            value += 360
-        }
-        return value
+        PlanetariumHeading.normalizedDegrees(headingDegrees)
     }
 
     private var cardinalDirection: String {
-        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        let index = Int((normalizedHeading / 45.0).rounded()) % directions.count
-        return directions[index]
+        PlanetariumHeading.cardinalDirection(for: headingDegrees)
     }
 
     var body: some View {
         VStack(spacing: 6) {
             Image(systemName: "location.north.circle.fill")
-                .font(.system(size: 52))
+                .font(.system(size: iconSize))
                 .symbolRenderingMode(.hierarchical)
                 .rotationEffect(.degrees(-normalizedHeading))
                 .animation(.easeOut(duration: 0.12), value: normalizedHeading)
@@ -298,21 +279,21 @@ private struct PhotoModeToolbar: View {
     let exitPhotoMode: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
+        ControlGroup {
             Button(action: capturePhoto) {
                 Label("Save Photo", systemImage: "square.and.arrow.down")
             }
-            .accessibilityLabel("Save full resolution photo")
+            .help("Save full resolution photo")
 
             Button(action: exitPhotoMode) {
                 Label("Exit Photo", systemImage: "xmark")
             }
             .keyboardShortcut("f", modifiers: [.command, .shift])
-            .accessibilityLabel("Exit photo mode")
+            .help("Exit photo mode")
         }
-        .buttonStyle(.bordered)
+        .controlSize(.large)
         .padding(10)
-        .controlGlass(cornerRadius: 12, interactive: true)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -330,25 +311,10 @@ private struct InspectorControls: View {
     @Binding var photoCaptureTrigger: Bool
     @Binding var observationMode: ObservationMode
     @Binding var planetariumLocation: PlanetariumLocation
-    let planetariumHeadingDegrees: Double
     @Binding var options: NativeRenderOptions
     let isTargetLocked: Bool
     let clearTargetLock: () -> Void
     let setPhotoMode: (Bool) -> Void
-
-    private var normalizedHeading: Double {
-        var value = planetariumHeadingDegrees.truncatingRemainder(dividingBy: 360)
-        if value < 0 {
-            value += 360
-        }
-        return value
-    }
-
-    private var cardinalDirection: String {
-        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        let index = Int((normalizedHeading / 45.0).rounded()) % directions.count
-        return directions[index]
-    }
 
     private var timeRateIndex: Binding<Double> {
         Binding(
@@ -385,9 +351,12 @@ private struct InspectorControls: View {
         observationMode == .planetarium ? 0.0...log10(PlanetariumLimits.maxZoom) : -5.0...2.4
     }
 
+    private var cameraControlLabel: String {
+        observationMode == .planetarium ? "Zoom" : "Camera Distance"
+    }
+
     var body: some View {
         Form {
-            // Target Info Section
             Section {
                 LabeledContent("Target") {
                     Text(observationMode == .planetarium ? "Planetarium" : selectedBody.name)
@@ -416,7 +385,6 @@ private struct InspectorControls: View {
                 }
             }
 
-            // Observation Mode Section
             Section("Observation") {
                 Picker("Mode", selection: $observationMode) {
                     ForEach(ObservationMode.allCases) { mode in
@@ -425,21 +393,16 @@ private struct InspectorControls: View {
                 }
                 .pickerStyle(.segmented)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(observationMode == .planetarium ? "Zoom" : "Camera Distance")
-                        Spacer()
-                        if observationMode == .planetarium {
-                            Text("\(Int(cameraDistance.rounded()))×")
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        }
+                LabeledContent(cameraControlLabel) {
+                    if observationMode == .planetarium {
+                        Text("\(Int(cameraDistance.rounded()))×")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
                     }
-                    Slider(value: cameraControlValue, in: cameraControlRange)
                 }
+                Slider(value: cameraControlValue, in: cameraControlRange)
             }
 
-            // Time Controls Section
             Section("Time") {
                 DatePicker(
                     "Date & Time",
@@ -454,20 +417,16 @@ private struct InspectorControls: View {
                             .foregroundStyle(.green)
                     }
                 } else {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Speed")
-                            Spacer()
-                            Text(TimeRatePreset.label(for: timeRate))
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        }
-                        Slider(
-                            value: timeRateIndex,
-                            in: 0...Double(TimeRatePreset.all.count - 1),
-                            step: 1
-                        )
+                    LabeledContent("Speed") {
+                        Text(TimeRatePreset.label(for: timeRate))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
                     }
+                    Slider(
+                        value: timeRateIndex,
+                        in: 0...Double(TimeRatePreset.all.count - 1),
+                        step: 1
+                    )
                 }
 
                 Text(simulationDate.formatted(date: .abbreviated, time: .standard))
@@ -475,7 +434,7 @@ private struct InspectorControls: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 8) {
+                ControlGroup {
                     Button {
                         isPaused.toggle()
                     } label: {
@@ -508,19 +467,15 @@ private struct InspectorControls: View {
                     }
                     .help("Sync to real-time clock")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
 
-            // Display Options Section
             Section("Display") {
                 Toggle("Orbit Lines", isOn: $options.showOrbits)
                 Toggle("Nametags", isOn: $options.showLabels)
             }
 
-            // Capture Section
             Section("Capture") {
-                HStack(spacing: 8) {
+                ControlGroup {
                     Button {
                         setPhotoMode(true)
                     } label: {
@@ -535,11 +490,8 @@ private struct InspectorControls: View {
                     }
                     .help("Save snapshot of current view")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
 
-            // Lock Controls
             Section {
                 Button {
                     clearTargetLock()
@@ -550,25 +502,12 @@ private struct InspectorControls: View {
                 .help("Clear lock on selected celestial body")
             }
 
-            // Conditional Planetarium Location Controls
             if observationMode == .planetarium {
-                Section("Heading") {
-                    LabeledContent("Direction") {
-                        Text(cardinalDirection)
-                            .fontWeight(.semibold)
-                    }
-                    LabeledContent("Bearing") {
-                        Text("\(Int(normalizedHeading.rounded()))°")
-                            .monospacedDigit()
-                    }
-                }
-
                 Section("Location") {
                     PlanetariumLocationControls(location: $planetariumLocation)
                 }
             }
         }
-        .formStyle(.grouped)
         .onChange(of: timeRate) { _, _ in
             isLiveView = false
         }
@@ -603,54 +542,68 @@ private struct PlanetariumLocationControls: View {
         )
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Location")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Menu {
-                    ForEach(PlanetariumLocation.presets, id: \.name) { preset in
-                        Button(preset.name) {
-                            location = preset
-                        }
-                    }
-                } label: {
-                    Label("Presets", systemImage: "mappin.and.ellipse")
+    private var presetName: Binding<String> {
+        Binding(
+            get: {
+                if PlanetariumLocation.presets.contains(where: { $0.name == location.name }) {
+                    return location.name
+                }
+                return "Custom"
+            },
+            set: { newName in
+                if let preset = PlanetariumLocation.presets.first(where: { $0.name == newName }) {
+                    location = preset
                 }
             }
+        )
+    }
 
-            HStack(spacing: 10) {
-                CoordinateField(title: "Lat", value: latitude, range: -90...90)
-                CoordinateField(title: "Lon", value: longitude, range: -180...180)
+    var body: some View {
+        Picker("Preset", selection: presetName) {
+            Text("Custom").tag("Custom")
+            ForEach(PlanetariumLocation.presets, id: \.name) { preset in
+                Text(preset.name).tag(preset.name)
             }
         }
+
+        CoordinateControl(
+            title: "Latitude",
+            value: latitude,
+            range: -90...90,
+            rangeLabel: "-90...90"
+        )
+
+        CoordinateControl(
+            title: "Longitude",
+            value: longitude,
+            range: -180...180,
+            rangeLabel: "-180...180"
+        )
     }
 }
 
-
-
-private struct CoordinateField: View {
+private struct CoordinateControl: View {
     let title: String
     @Binding var value: Double
     let range: ClosedRange<Double>
+    let rangeLabel: String
 
     var body: some View {
         LabeledContent(title) {
-            TextField(
-                title,
-                value: $value,
-                format: .number.precision(.fractionLength(4))
-            )
-            .textFieldStyle(.roundedBorder)
-            .monospacedDigit()
-            .frame(width: 92)
+            HStack(spacing: 8) {
+                TextField(title, value: $value, format: .number.precision(.fractionLength(4)))
+                    .textFieldStyle(.roundedBorder)
+                    .monospacedDigit()
+                    .frame(width: 96)
 
-            Stepper(title, value: $value, in: range, step: 0.1)
-                .labelsHidden()
+                Stepper(title, value: $value, in: range, step: 0.1)
+                    .labelsHidden()
+
+                Text(rangeLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 64, alignment: .leading)
+            }
         }
     }
 }
@@ -677,84 +630,3 @@ private extension NativeCelestialBody {
         return "Orbiting \(parentName) at \(semiMajorAxisKilometers.formatted()) km"
     }
 }
-
-#if os(macOS)
-struct VisualEffectView: NSViewRepresentable {
-    var material: NSVisualEffectView.Material = .hudWindow
-    var blendingMode: NSVisualEffectView.BlendingMode = .withinWindow
-    var state: NSVisualEffectView.State = .active
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = material
-        view.blendingMode = blendingMode
-        view.state = state
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blendingMode
-        nsView.state = state
-    }
-}
-#endif
-
-struct ControlGlassModifier: ViewModifier {
-    var cornerRadius: CGFloat
-    var interactive: Bool = true
-    
-    func body(content: Content) -> some View {
-        content
-            .background(
-                ZStack {
-                    #if os(macOS)
-                    VisualEffectView(material: .hudWindow, blendingMode: .withinWindow, state: .active)
-                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                    #else
-                    Rectangle()
-                        .fill(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                    #endif
-                    
-                    // Liquid glass sheen overlay (gloss)
-                    LinearGradient(
-                        colors: [
-                            .white.opacity(0.15),
-                            .white.opacity(0.03),
-                            .clear,
-                            .black.opacity(0.12)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                    
-                    // Shiny bevel border (specular edges)
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(
-                            LinearGradient(
-                                colors: [
-                                    .white.opacity(0.4),
-                                    .white.opacity(0.1),
-                                    .clear,
-                                    .black.opacity(0.25)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1.0
-                        )
-                }
-            )
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .shadow(color: .black.opacity(0.3), radius: 12, x: 0, y: 6)
-    }
-}
-
-extension View {
-    func controlGlass(cornerRadius: CGFloat, interactive: Bool = true) -> some View {
-        self.modifier(ControlGlassModifier(cornerRadius: cornerRadius, interactive: interactive))
-    }
-}
-

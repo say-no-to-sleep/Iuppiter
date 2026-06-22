@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import subprocess
 import tempfile
 from pathlib import Path
-
-import requests
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +65,7 @@ struct DumpPositions {
         fmt.timeZone = TimeZone(secondsFromGMT: 0)
         let j2000 = DateComponents(calendar: Calendar(identifier: .gregorian), timeZone: TimeZone(abbreviation: "UTC"), year: 2000, month: 1, day: 1, hour: 12).date!
         let days = now.timeIntervalSince(j2000) / 86400.0
-        let elapsed = Float(days / 5.0)
+        let elapsed = days / 5.0
         let snapshot = SolarSystemSimulation.snapshot(elapsedSeconds: elapsed, selectedBodyID: "sun", options: NativeRenderOptions(showMoons: true, showMinorMoons: true, showProcedural: true, showLabels: true, showOrbits: true))
         print("utc,\\(fmt.string(from: now))")
         for state in snapshot.states {
@@ -130,7 +131,10 @@ def horizon_vector(body_id: int, center: str, utc: str) -> tuple[float, float, f
         "VEC_CORR": "NONE",
         "OUT_UNITS": "KM-S",
     }
-    data = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=params, timeout=30).json()
+    url = "https://ssd.jpl.nasa.gov/api/horizons.api?" + urlencode(params)
+    request = Request(url, headers={"User-Agent": "Iuppiter-Horizons-Verifier/1.0"})
+    with urlopen(request, timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
     if "error" in data:
         raise RuntimeError(data["error"])
     text = data["result"]

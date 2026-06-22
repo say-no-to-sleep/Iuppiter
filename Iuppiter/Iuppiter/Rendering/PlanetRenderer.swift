@@ -2,15 +2,9 @@
 import Foundation
 import ImageIO
 import MetalKit
-import ModelIO
+import OSLog
 import simd
 import UniformTypeIdentifiers
-
-private struct SphereVertex {
-    var position: SIMD3<Float>
-    var normal: SIMD3<Float>
-    var uv: SIMD2<Float>
-}
 
 private struct OrbitVertex {
     var position: SIMD3<Float>
@@ -60,21 +54,6 @@ private struct LightingParameters {
     var padding: SIMD2<Float>
 }
 
-private struct ShapeMeshResource {
-    let parts: [ShapeMeshPart]
-    let normalizationTransform: simd_float4x4
-    let usesProjectedTextureCoordinates: Bool
-}
-
-private struct ShapeMeshPart {
-    let vertexBuffer: MTLBuffer
-    let vertexBufferOffset: Int
-    let indexBuffer: MTLBuffer
-    let indexBufferOffset: Int
-    let indexCount: Int
-    let indexType: MTLIndexType
-}
-
 private struct LightingContext {
     let occluders: [LightingOccluder]
     let occluderIndicesByBodyID: [String: Int32]
@@ -100,31 +79,39 @@ private struct CameraProjectionMetrics {
     let skyScale: Float
 }
 
-private enum RemoteTextureProcessing: Hashable {
-    /// Load the downloaded bytes verbatim via MTKTextureLoader.
-    case raw
-    /// Extract a single cloud-density channel from the source image. The real
-    /// cloud mask in maps like Matt Eason's `clouds-alpha.png` lives in the
-    /// alpha channel (the luminance channel is a land/sea overlay and is useless
-    /// as a mask), and MTKTextureLoader's decode of luminance+alpha PNGs does
-    /// not reliably surface that alpha to the shader — so we decode and extract
-    /// it on the CPU into a clean grayscale texture.
-    case cloudDensity
-}
+private enum PlanetRendererError: LocalizedError {
+    case commandQueueUnavailable
+    case meshBufferAllocationFailed
+    case shaderLibraryUnavailable(String)
+    case shaderFunctionUnavailable(String)
+    case pipelineCreationFailed(String)
+    case depthStateCreationFailed
+    case fallbackTextureCreationFailed
+    case samplerCreationFailed
+    case uniformLayoutMismatch(String)
 
-private struct RemoteTextureKey: Hashable {
-    let urlString: String
-    let isSRGB: Bool
-    let processing: RemoteTextureProcessing
-}
-
-private final class RemoteTextureEntry {
-    var texture: MTLTexture?
-    // Sentinel in the distant past so a brand-new entry always refreshes on its
-    // first use, regardless of how large the refresh interval is or how recently
-    // the machine booted (timestamps are seconds-since-boot, not wall clock).
-    var lastRequestTime: CFTimeInterval = -.greatestFiniteMagnitude
-    var isLoading = false
+    var errorDescription: String? {
+        switch self {
+        case .commandQueueUnavailable:
+            return "Metal command queue creation failed."
+        case .meshBufferAllocationFailed:
+            return "Metal mesh buffer allocation failed."
+        case .shaderLibraryUnavailable(let message):
+            return "Metal shader library could not be loaded: \(message)"
+        case .shaderFunctionUnavailable(let name):
+            return "Metal shader function '\(name)' is missing."
+        case .pipelineCreationFailed(let message):
+            return "Metal render pipeline creation failed: \(message)"
+        case .depthStateCreationFailed:
+            return "Metal depth state creation failed."
+        case .fallbackTextureCreationFailed:
+            return "Metal fallback texture creation failed."
+        case .samplerCreationFailed:
+            return "Metal sampler state creation failed."
+        case .uniformLayoutMismatch(let message):
+            return "Swift/Metal uniform layout mismatch: \(message)"
+        }
+    }
 }
 
 /// Describes a planet's equatorial ring plane for ring-shadow projection onto the surface.
@@ -156,10 +143,18 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
     private static let maxLightingOccluders = 32
     private static let skyTextureName = "16k_deep_star_map.jpg"
     private static let j2000MeanObliquityRadians = Float(23.4392911 * .pi / 180.0)
+    private static let expectedRenderUniformStride = 304
+    private static let expectedLightingOccluderStride = 16
+    private static let expectedLightingParametersStride = 32
+    private static let expectedRingShadowStride = 48
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "Iuppiter",
+        category: "PlanetRenderer"
+    )
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private let textureLoader: MTKTextureLoader
+    private let samplerState: MTLSamplerState
     private let spherePipelineState: MTLRenderPipelineState
     private let ringPipelineState: MTLRenderPipelineState
     private let orbitPipelineState: MTLRenderPipelineState
@@ -174,11 +169,10 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
     private let ringIndexBuffer: MTLBuffer
     private let ringIndexCount: Int
     private let fallbackTexture: MTLTexture
-    private var textureCache: [String: MTLTexture] = [:]
-    private var dataTextureCache: [String: MTLTexture] = [:]
-    private var remoteTextureCache: [RemoteTextureKey: RemoteTextureEntry] = [:]
-    private let remoteTextureLock = NSLock()
-    private var shapeMeshCache: [String: ShapeMeshResource] = [:]
+    private var textureStore: RendererTextureStore!
+    private var shapeMeshStore: RendererShapeMeshStore!
+    private var reportedIssueMessages = Set<String>()
+    private let reportedIssueLock = NSLock()
     private var orbitVertexBufferCache: [String: MTLBuffer] = [:]
 
     private var selectedBodyID = NativeBodyCatalog.defaultSelection.id
@@ -201,19 +195,22 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
     private var liveBlendStartSeconds: Double?
     private var liveBlendStartTime: CFTimeInterval = 0
     private var pendingPhotoCapture = false
+    private var lastLabelUpdateTime: CFTimeInterval = -.greatestFiniteMagnitude
+    private var lastLabelViewportSize = CGSize.zero
     var onZoom: ((Float) -> Void)?
     var onSimulationDateChange: ((Date) -> Void)?
     var onPlanetariumHeadingChange: ((Double) -> Void)?
     var onBodyPick: ((String?) -> Void)?
+    var onPhotoCapture: ((Data) -> Void)?
+    var onRendererError: ((String) -> Void)?
 
-    init?(device: MTLDevice, metalView: MTKView) {
+    init(device: MTLDevice, metalView: MTKView) throws {
         self.device = device
 
         guard let commandQueue = device.makeCommandQueue() else {
-            return nil
+            throw PlanetRendererError.commandQueueUnavailable
         }
         self.commandQueue = commandQueue
-        self.textureLoader = MTKTextureLoader(device: device)
 
         let mesh = SphereMesh.make(latitudeBands: 72, longitudeBands: 144)
         let ringMesh = RingMesh.make(segments: 192)
@@ -237,7 +234,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
             length: ringMesh.indices.count * MemoryLayout<UInt32>.stride,
             options: [.storageModeShared]
         ) else {
-            return nil
+            throw PlanetRendererError.meshBufferAllocationFailed
         }
         self.vertexBuffer = vertexBuffer
         self.indexBuffer = indexBuffer
@@ -248,19 +245,20 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
 
         let library: MTLLibrary
         do {
-            library = try device.makeLibrary(source: MetalShaderSource.planet, options: nil)
+            library = try device.makeDefaultLibrary(bundle: .main)
         } catch {
-            return nil
+            guard let defaultLibrary = device.makeDefaultLibrary() else {
+                throw PlanetRendererError.shaderLibraryUnavailable(error.localizedDescription)
+            }
+            library = defaultLibrary
         }
-        guard let planetVertex = library.makeFunction(name: "planetVertex"),
-              let planetFragment = library.makeFunction(name: "planetFragment"),
-              let ringFragment = library.makeFunction(name: "ringFragment"),
-              let orbitVertex = library.makeFunction(name: "orbitVertex"),
-              let orbitFragment = library.makeFunction(name: "orbitFragment"),
-              let flareVertex = library.makeFunction(name: "flareVertex"),
-              let flareFragment = library.makeFunction(name: "flareFragment") else {
-            return nil
-        }
+        let planetVertex = try Self.makeShaderFunction(named: "planetVertex", in: library)
+        let planetFragment = try Self.makeShaderFunction(named: "planetFragment", in: library)
+        let ringFragment = try Self.makeShaderFunction(named: "ringFragment", in: library)
+        let orbitVertex = try Self.makeShaderFunction(named: "orbitVertex", in: library)
+        let orbitFragment = try Self.makeShaderFunction(named: "orbitFragment", in: library)
+        let flareVertex = try Self.makeShaderFunction(named: "flareVertex", in: library)
+        let flareFragment = try Self.makeShaderFunction(named: "flareFragment", in: library)
 
         let sphereVertexDescriptor = MTLVertexDescriptor()
         sphereVertexDescriptor.attributes[0].format = .float3
@@ -334,7 +332,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
             self.orbitPipelineState = try device.makeRenderPipelineState(descriptor: orbitPipelineDescriptor)
             self.flarePipelineState = try device.makeRenderPipelineState(descriptor: flarePipelineDescriptor)
         } catch {
-            return nil
+            throw PlanetRendererError.pipelineCreationFailed(error.localizedDescription)
         }
 
         let opaqueDepthDescriptor = MTLDepthStencilDescriptor()
@@ -351,16 +349,63 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
 
         guard let opaqueDepthState = device.makeDepthStencilState(descriptor: opaqueDepthDescriptor),
               let transparentDepthState = device.makeDepthStencilState(descriptor: transparentDepthDescriptor),
-              let overlayDepthState = device.makeDepthStencilState(descriptor: overlayDepthDescriptor),
-              let fallbackTexture = PlanetRenderer.makeFallbackTexture(device: device) else {
-            return nil
+              let overlayDepthState = device.makeDepthStencilState(descriptor: overlayDepthDescriptor) else {
+            throw PlanetRendererError.depthStateCreationFailed
+        }
+        guard let fallbackTexture = PlanetRenderer.makeFallbackTexture(device: device) else {
+            throw PlanetRendererError.fallbackTextureCreationFailed
+        }
+        guard let samplerState = PlanetRenderer.makeLinearSampler(device: device) else {
+            throw PlanetRendererError.samplerCreationFailed
         }
         self.opaqueDepthState = opaqueDepthState
         self.transparentDepthState = transparentDepthState
         self.overlayDepthState = overlayDepthState
         self.fallbackTexture = fallbackTexture
+        self.samplerState = samplerState
+
+        try Self.validateUniformLayouts()
 
         super.init()
+        self.textureStore = RendererTextureStore(
+            device: device,
+            commandQueue: commandQueue,
+            fallbackTexture: fallbackTexture,
+            reportIssue: { [weak self] message in
+                self?.reportIssue(message)
+            }
+        )
+        self.shapeMeshStore = RendererShapeMeshStore(device: device)
+    }
+
+    private static func makeShaderFunction(named name: String, in library: MTLLibrary) throws -> MTLFunction {
+        guard let function = library.makeFunction(name: name) else {
+            throw PlanetRendererError.shaderFunctionUnavailable(name)
+        }
+        return function
+    }
+
+    private static func makeLinearSampler(device: MTLDevice) -> MTLSamplerState? {
+        let descriptor = MTLSamplerDescriptor()
+        descriptor.minFilter = .linear
+        descriptor.magFilter = .linear
+        descriptor.mipFilter = .linear
+        descriptor.sAddressMode = .repeat
+        descriptor.tAddressMode = .clampToEdge
+        return device.makeSamplerState(descriptor: descriptor)
+    }
+
+    private static func validateUniformLayouts() throws {
+        let layouts = [
+            ("RenderUniforms", MemoryLayout<RenderUniforms>.stride, expectedRenderUniformStride),
+            ("LightingOccluder", MemoryLayout<LightingOccluder>.stride, expectedLightingOccluderStride),
+            ("LightingParameters", MemoryLayout<LightingParameters>.stride, expectedLightingParametersStride),
+            ("RingShadow", MemoryLayout<RingShadow>.stride, expectedRingShadowStride),
+        ]
+
+        for (name, actual, expected) in layouts where actual != expected {
+            throw PlanetRendererError.uniformLayoutMismatch("\(name) stride is \(actual), expected \(expected).")
+        }
     }
 
     func update(
@@ -552,13 +597,12 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         ))
         let forward = -cameraOffsetDirection
         let right = normalize(SIMD3<Float>(cos(cameraYaw), 0, -sin(cameraYaw)))
-        let up = normalize(cross(right, forward))
 
         switch move {
         case .forward:
-            cameraTargetOffset += up * panStep
+            cameraTargetOffset += forward * panStep
         case .backward:
-            cameraTargetOffset -= up * panStep
+            cameraTargetOffset -= forward * panStep
         case .left:
             cameraTargetOffset -= right * panStep
         case .right:
@@ -626,6 +670,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         }
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            reportIssue("Metal command buffer creation failed.")
             return
         }
 
@@ -640,6 +685,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
                 clearColor: view.clearColor,
                 clearDepth: view.clearDepth
             ) else {
+                reportIssue("Unable to allocate photo render target.")
                 return
             }
             photoRenderTarget = target
@@ -710,20 +756,24 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         }
 
         if options.showLabels {
-            updateLabels(
-                snapshot: snapshot,
-                viewProjection: viewProjection,
-                viewportSize: view.bounds.size,
-                focus: focus,
-                hiddenBodyIDs: visuallyOccludedBodyIDs
-            )
+            let labelViewportSize = view.bounds.size
+            if shouldUpdateLabels(at: now, viewportSize: labelViewportSize) {
+                updateLabels(
+                    snapshot: snapshot,
+                    viewProjection: viewProjection,
+                    viewportSize: labelViewportSize,
+                    focus: focus,
+                    hiddenBodyIDs: visuallyOccludedBodyIDs,
+                    timestamp: now
+                )
+            }
         } else {
             DispatchQueue.main.async { [weak viewport] in
                 viewport?.update(labels: [])
             }
         }
 
-        encoder.setFragmentSamplerState(SamplerCache.linearSampler(device: device), index: 0)
+        encoder.setFragmentSamplerState(samplerState, index: 0)
         drawSkyBackground(
             encoder: encoder,
             cameraWorldPos: eyeRelative,
@@ -744,7 +794,7 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
                 continue
             }
 
-            let isProcedural = state.body.assetTier == "procedural"
+            let isProcedural = state.body.assetTier == .procedural
             let isStar       = state.body.kind == .star
             let bodyPos      = state.position - focus
             let starCameraDistance: Float = isStar
@@ -932,8 +982,8 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         descriptor.storageMode = .shared
 
         guard let readbackTexture = device.makeTexture(descriptor: descriptor),
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder(),
-              let outputURL = Self.makePhotoOutputURL() else {
+              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            reportIssue("Unable to prepare photo texture readback.")
             return
         }
 
@@ -950,31 +1000,23 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         )
         blitEncoder.endEncoding()
 
-        commandBuffer.addCompletedHandler { _ in
-            Self.writePNG(texture: readbackTexture, to: outputURL)
+        commandBuffer.addCompletedHandler { [weak self] completedBuffer in
+            guard let self else { return }
+            if let error = completedBuffer.error {
+                self.reportIssue("Photo capture failed: \(error.localizedDescription)")
+                return
+            }
+            guard let data = Self.pngData(texture: readbackTexture) else {
+                self.reportIssue("Unable to encode captured photo as PNG.")
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.onPhotoCapture?(data)
+            }
         }
     }
 
-    private static func makePhotoOutputURL() -> URL? {
-        let fileManager = FileManager.default
-        let baseDirectory = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first
-            ?? fileManager.homeDirectoryForCurrentUser
-        let outputDirectory = baseDirectory.appendingPathComponent("Iuppiter Photos", isDirectory: true)
-
-        do {
-            try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss-SSS"
-        let timestamp = formatter.string(from: Date())
-        return outputDirectory.appendingPathComponent("Iuppiter-\(timestamp).png")
-    }
-
-    private static func writePNG(texture: MTLTexture, to url: URL) {
+    private static func pngData(texture: MTLTexture) -> Data? {
         let bytesPerPixel = 4
         let bytesPerRow = texture.width * bytesPerPixel
         let byteCount = bytesPerRow * texture.height
@@ -1005,13 +1047,24 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
                 decode: nil,
                 shouldInterpolate: false,
                 intent: .defaultIntent
-              ),
-              let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-            return
+              ) else {
+            return nil
         }
 
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
         CGImageDestinationAddImage(destination, image, nil)
-        CGImageDestinationFinalize(destination)
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+        return output as Data
     }
 
     private func drawSkyBackground(
@@ -1153,29 +1206,22 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         vertices.reserveCapacity(E_values.count)
 
         for E in E_values {
-            // 1. Orbital plane coordinates (x towards periapsis)
-            let xp = orbit.semiMajorAxis * (cos(E) - orbit.eccentricity)
-            let zp = orbit.semiMajorAxis * sqrt(1.0 - orbit.eccentricity * orbit.eccentricity) * sin(E)
-            let flat = SIMD3<Float>(xp, 0.0, zp)
-            
-            // 2. Rotate by argument of periapsis in plane (around Y-axis)
-            let rotatedInPlane = rotateVector(flat, radians: -orbit.argumentOfPeriapsis, axis: SIMD3<Float>(0, 1, 0))
-            
-            // 3. Tilt by inclination around X-axis
-            let tilted = rotateVector(rotatedInPlane, radians: orbit.inclination, axis: SIMD3<Float>(1, 0, 0))
-            
-            // 4. Rotate by longitude of ascending node around Y-axis
-            let positioned = rotateVector(tilted, radians: -orbit.longitudeOfAscendingNode, axis: SIMD3<Float>(0, 1, 0))
-            
-            // 5. If equatorial-referenced (BODY), tilt by the parent planet's axial tilt around the X-axis
-            var finalOffset = positioned
-            if orbit.referencePlane == "BODY" {
-                let parentTiltRad = orbit.parentAxialTiltDegrees * .pi / 180.0
-                finalOffset = rotateVector(positioned, radians: parentTiltRad, axis: SIMD3<Float>(1, 0, 0))
-            }
-            finalOffset.x = -finalOffset.x
-            
-            let position = (orbit.center - focus) + finalOffset
+            let finalOffset = OrbitGeometry.offset(
+                semiMajorAxis: Double(orbit.semiMajorAxis),
+                eccentricity: Double(orbit.eccentricity),
+                inclinationDegrees: Double(orbit.inclination) * 180.0 / Double.pi,
+                longitudeOfAscendingNodeDegrees: Double(orbit.longitudeOfAscendingNode) * 180.0 / Double.pi,
+                argumentOfPeriapsisDegrees: Double(orbit.argumentOfPeriapsis) * 180.0 / Double.pi,
+                eccentricAnomaly: Double(E),
+                referencePlane: orbit.referencePlane,
+                parentAxialTiltDegrees: orbit.parentAxialTiltDegrees
+            )
+            let offset = SIMD3<Float>(
+                Float(finalOffset.x),
+                Float(finalOffset.y),
+                Float(finalOffset.z)
+            )
+            let position = (orbit.center - focus) + offset
             vertices.append(OrbitVertex(position: position, color: orbit.color))
         }
 
@@ -2013,21 +2059,36 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         return simd_float4x4.rotation(radians: angle, axis: axis)
     }
 
+    private func shouldUpdateLabels(at timestamp: CFTimeInterval, viewportSize: CGSize) -> Bool {
+        if timestamp - lastLabelUpdateTime >= 1.0 / 30.0 {
+            return true
+        }
+
+        let widthChanged = abs(lastLabelViewportSize.width - viewportSize.width) >= 1
+        let heightChanged = abs(lastLabelViewportSize.height - viewportSize.height) >= 1
+        return widthChanged || heightChanged
+    }
+
     private func updateLabels(
         snapshot: SolarSystemSnapshot,
         viewProjection: simd_float4x4,
         viewportSize: CGSize,
         focus: SIMD3<Float>,
-        hiddenBodyIDs: Set<String>
+        hiddenBodyIDs: Set<String>,
+        timestamp: CFTimeInterval
     ) {
         guard let viewport else {
             return
         }
 
+        lastLabelUpdateTime = timestamp
+        lastLabelViewportSize = viewportSize
+
         let width = max(viewportSize.width, 1)
         let height = max(viewportSize.height, 1)
         let selectedID = snapshot.selectedState.body.id
-        let labels = snapshot.states.compactMap { state -> SolarSystemLabel? in
+        let edgeInset: CGFloat = 16
+        let candidates = snapshot.states.compactMap { state -> (label: SolarSystemLabel, priority: Float)? in
             if hiddenBodyIDs.contains(state.body.id) {
                 return nil
             }
@@ -2049,16 +2110,31 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
                 return nil
             }
 
-            return SolarSystemLabel(
+            let rawX = CGFloat((normalized.x * 0.5 + 0.5) * Float(width))
+            let rawY = CGFloat((1.0 - (normalized.y * 0.5 + 0.5)) * Float(height))
+            let position = CGPoint(
+                x: min(max(rawX, edgeInset), width - edgeInset).rounded(.toNearestOrAwayFromZero),
+                y: min(max(rawY, edgeInset), height - edgeInset).rounded(.toNearestOrAwayFromZero)
+            )
+            let label = SolarSystemLabel(
                 id: state.body.id,
                 name: state.body.name,
-                position: CGPoint(
-                    x: CGFloat((normalized.x * 0.5 + 0.5) * Float(width)),
-                    y: CGFloat((1.0 - (normalized.y * 0.5 + 0.5)) * Float(height))
-                ),
+                position: position,
                 isSelected: state.body.id == selectedID,
                 displayColor: state.body.displayColor
             )
+            let priority = (state.body.id == selectedID ? 1_000_000 : 0) + state.sceneRadius
+            return (label, priority)
+        }
+
+        var labels: [SolarSystemLabel] = []
+        labels.reserveCapacity(candidates.count)
+        let minimumSpacingSquared: CGFloat = 30 * 30
+        for candidate in candidates.sorted(by: { $0.priority > $1.priority }) {
+            if candidate.label.isSelected
+                || !labels.contains(where: { squaredDistance($0.position, candidate.label.position) < minimumSpacingSquared }) {
+                labels.append(candidate.label)
+            }
         }
 
         DispatchQueue.main.async { [weak viewport] in
@@ -2066,28 +2142,14 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         }
     }
 
+    private func squaredDistance(_ lhs: CGPoint, _ rhs: CGPoint) -> CGFloat {
+        let dx = lhs.x - rhs.x
+        let dy = lhs.y - rhs.y
+        return dx * dx + dy * dy
+    }
+
     private func shapeMesh(named name: String) -> ShapeMeshResource? {
-        if let cached = shapeMeshCache[name] {
-            return cached
-        }
-
-        guard let url = Bundle.main.modelURL(named: name) ?? Bundle.main.textureURL(named: name) else {
-            return nil
-        }
-
-        let resource: ShapeMeshResource?
-        if url.pathExtension.lowercased() == "obj" {
-            resource = objShapeMesh(url: url)
-        } else if url.pathExtension.lowercased() == "msh" {
-            resource = orbiterMshShapeMesh(url: url)
-        } else {
-            resource = modelIOShapeMesh(url: url)
-        }
-
-        if let resource {
-            shapeMeshCache[name] = resource
-        }
-        return resource
+        shapeMeshStore.shapeMesh(named: name)
     }
 
     /// Returns the live base-map texture for a body if one is configured and has
@@ -2165,377 +2227,12 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         return maps.specularMapName.map { dataTexture(named: $0) }
     }
 
-    private func objShapeMesh(url: URL) -> ShapeMeshResource? {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            return nil
-        }
-
-        var positions: [SIMD3<Float>] = []
-        var indices: [UInt32] = []
-        positions.reserveCapacity(16_384)
-        indices.reserveCapacity(65_536)
-
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("v ") {
-                let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-                guard parts.count >= 4,
-                      let x = Float(parts[1]),
-                      let y = Float(parts[2]),
-                      let z = Float(parts[3]) else {
-                    continue
-                }
-                positions.append(SIMD3<Float>(x, y, z))
-            } else if line.hasPrefix("f ") {
-                let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-                guard parts.count >= 4 else {
-                    continue
-                }
-                for part in parts[1...3] {
-                    let vertexToken = part.split(separator: "/", omittingEmptySubsequences: false).first ?? part
-                    guard let oneBasedIndex = UInt32(vertexToken), oneBasedIndex > 0 else {
-                        continue
-                    }
-                    indices.append(oneBasedIndex - 1)
-                }
-            }
-        }
-
-        guard positions.count >= 3, indices.count >= 3, indices.count % 3 == 0 else {
-            return nil
-        }
-
-        var normals = [SIMD3<Float>](repeating: .zero, count: positions.count)
-        for faceStart in stride(from: 0, to: indices.count, by: 3) {
-            let ia = Int(indices[faceStart])
-            let ib = Int(indices[faceStart + 1])
-            let ic = Int(indices[faceStart + 2])
-            guard ia < positions.count, ib < positions.count, ic < positions.count else {
-                continue
-            }
-            let normal = cross(positions[ib] - positions[ia], positions[ic] - positions[ia])
-            normals[ia] += normal
-            normals[ib] += normal
-            normals[ic] += normal
-        }
-
-        var vertices: [SphereVertex] = []
-        vertices.reserveCapacity(positions.count)
-        for index in positions.indices {
-            let accumulatedNormal = normals[index]
-            let fallbackNormal = length(positions[index]) > 0.0001 ? normalize(positions[index]) : SIMD3<Float>(0, 1, 0)
-            let normal = length(accumulatedNormal) > 0.0001 ? normalize(accumulatedNormal) : fallbackNormal
-            vertices.append(SphereVertex(position: positions[index], normal: normal, uv: SIMD2<Float>(0.5, 0.5)))
-        }
-
-        guard let vertexBuffer = device.makeBuffer(
-            bytes: vertices,
-            length: vertices.count * MemoryLayout<SphereVertex>.stride,
-            options: [.storageModeShared]
-        ),
-        let indexBuffer = device.makeBuffer(
-            bytes: indices,
-            length: indices.count * MemoryLayout<UInt32>.stride,
-            options: [.storageModeShared]
-        ) else {
-            return nil
-        }
-
-        return ShapeMeshResource(
-            parts: [
-                ShapeMeshPart(
-                    vertexBuffer: vertexBuffer,
-                    vertexBufferOffset: 0,
-                    indexBuffer: indexBuffer,
-                    indexBufferOffset: 0,
-                    indexCount: indices.count,
-                    indexType: .uint32
-                )
-            ],
-            normalizationTransform: normalizationTransform(for: positions),
-            usesProjectedTextureCoordinates: true
-        )
-    }
-
-    private func orbiterMshShapeMesh(url: URL) -> ShapeMeshResource? {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            return nil
-        }
-
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        var lineIndex = 0
-
-        while lineIndex < lines.count {
-            let line = lines[lineIndex].trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("GEOM ") else {
-                lineIndex += 1
-                continue
-            }
-
-            let headerParts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard headerParts.count >= 3,
-                  let vertexCount = Int(headerParts[1]),
-                  let faceCount = Int(headerParts[2]) else {
-                return nil
-            }
-
-            var vertices: [SphereVertex] = []
-            var positions: [SIMD3<Float>] = []
-            vertices.reserveCapacity(vertexCount)
-            positions.reserveCapacity(vertexCount)
-            lineIndex += 1
-
-            for _ in 0..<vertexCount {
-                guard lineIndex < lines.count else { return nil }
-                let parts = lines[lineIndex].split(whereSeparator: { $0 == " " || $0 == "\t" })
-                guard parts.count >= 8,
-                      let x = Float(parts[0]),
-                      let y = Float(parts[1]),
-                      let z = Float(parts[2]),
-                      let nx = Float(parts[3]),
-                      let ny = Float(parts[4]),
-                      let nz = Float(parts[5]),
-                      let u = Float(parts[6]),
-                      let v = Float(parts[7]) else {
-                    return nil
-                }
-
-                let position = SIMD3<Float>(x, y, z)
-                let rawNormal = SIMD3<Float>(nx, ny, nz)
-                let fallbackNormal = length(position) > 0.0001 ? normalize(position) : SIMD3<Float>(0, 1, 0)
-                let normal = length(rawNormal) > 0.0001 ? normalize(rawNormal) : fallbackNormal
-                positions.append(position)
-                vertices.append(SphereVertex(position: position, normal: normal, uv: SIMD2<Float>(u, v)))
-                lineIndex += 1
-            }
-
-            var indices: [UInt32] = []
-            indices.reserveCapacity(faceCount * 3)
-            for _ in 0..<faceCount {
-                guard lineIndex < lines.count else { return nil }
-                let parts = lines[lineIndex].split(whereSeparator: { $0 == " " || $0 == "\t" })
-                let vertexCountLimit = UInt32(vertexCount)
-                guard parts.count >= 3,
-                      let a = UInt32(parts[0]),
-                      let b = UInt32(parts[1]),
-                      let c = UInt32(parts[2]),
-                      a < vertexCountLimit,
-                      b < vertexCountLimit,
-                      c < vertexCountLimit else {
-                    return nil
-                }
-                indices.append(a)
-                indices.append(b)
-                indices.append(c)
-                lineIndex += 1
-            }
-
-            guard let vertexBuffer = device.makeBuffer(
-                bytes: vertices,
-                length: vertices.count * MemoryLayout<SphereVertex>.stride,
-                options: [.storageModeShared]
-            ),
-            let indexBuffer = device.makeBuffer(
-                bytes: indices,
-                length: indices.count * MemoryLayout<UInt32>.stride,
-                options: [.storageModeShared]
-            ) else {
-                return nil
-            }
-
-            return ShapeMeshResource(
-                parts: [
-                    ShapeMeshPart(
-                        vertexBuffer: vertexBuffer,
-                        vertexBufferOffset: 0,
-                        indexBuffer: indexBuffer,
-                        indexBufferOffset: 0,
-                        indexCount: indices.count,
-                        indexType: .uint32
-                    )
-                ],
-                normalizationTransform: normalizationTransform(for: positions),
-                usesProjectedTextureCoordinates: false
-            )
-        }
-
-        return nil
-    }
-
-    private func modelIOShapeMesh(url: URL) -> ShapeMeshResource? {
-        let vertexDescriptor = MDLVertexDescriptor()
-        vertexDescriptor.attributes[0] = MDLVertexAttribute(
-            name: MDLVertexAttributePosition,
-            format: .float3,
-            offset: 0,
-            bufferIndex: 0
-        )
-        vertexDescriptor.attributes[1] = MDLVertexAttribute(
-            name: MDLVertexAttributeNormal,
-            format: .float3,
-            offset: MemoryLayout<SIMD3<Float>>.stride,
-            bufferIndex: 0
-        )
-        vertexDescriptor.attributes[2] = MDLVertexAttribute(
-            name: MDLVertexAttributeTextureCoordinate,
-            format: .float2,
-            offset: MemoryLayout<SIMD3<Float>>.stride * 2,
-            bufferIndex: 0
-        )
-        vertexDescriptor.layouts[0] = MDLVertexBufferLayout(stride: MemoryLayout<SphereVertex>.stride)
-
-        let allocator = MTKMeshBufferAllocator(device: device)
-        let asset = MDLAsset(url: url, vertexDescriptor: vertexDescriptor, bufferAllocator: allocator)
-        let mdlMeshes = asset.childObjects(of: MDLMesh.self).compactMap { $0 as? MDLMesh }
-        guard !mdlMeshes.isEmpty else {
-            return nil
-        }
-
-        var parts: [ShapeMeshPart] = []
-        var minBounds = SIMD3<Float>(repeating: Float.greatestFiniteMagnitude)
-        var maxBounds = SIMD3<Float>(repeating: -Float.greatestFiniteMagnitude)
-
-        for mdlMesh in mdlMeshes {
-            if mdlMesh.vertexAttributeData(forAttributeNamed: MDLVertexAttributeNormal, as: .float3) == nil {
-                mdlMesh.addNormals(withAttributeNamed: MDLVertexAttributeNormal, creaseThreshold: 0.4)
-            }
-
-            updateBounds(from: mdlMesh.boundingBox, minBounds: &minBounds, maxBounds: &maxBounds)
-            guard let mtkMesh = try? MTKMesh(mesh: mdlMesh, device: device),
-                  let vertexBuffer = mtkMesh.vertexBuffers.first else {
-                continue
-            }
-
-            for submesh in mtkMesh.submeshes where submesh.indexCount > 0 {
-                parts.append(
-                    ShapeMeshPart(
-                        vertexBuffer: vertexBuffer.buffer,
-                        vertexBufferOffset: vertexBuffer.offset,
-                        indexBuffer: submesh.indexBuffer.buffer,
-                        indexBufferOffset: submesh.indexBuffer.offset,
-                        indexCount: submesh.indexCount,
-                        indexType: submesh.indexType
-                    )
-                )
-            }
-        }
-
-        guard !parts.isEmpty else {
-            return nil
-        }
-
-        return ShapeMeshResource(
-            parts: parts,
-            normalizationTransform: normalizationTransform(minBounds: minBounds, maxBounds: maxBounds),
-            usesProjectedTextureCoordinates: true
-        )
-    }
-
-    private func updateBounds(
-        from box: MDLAxisAlignedBoundingBox,
-        minBounds: inout SIMD3<Float>,
-        maxBounds: inout SIMD3<Float>
-    ) {
-        let boxMin = SIMD3<Float>(box.minBounds.x, box.minBounds.y, box.minBounds.z)
-        let boxMax = SIMD3<Float>(box.maxBounds.x, box.maxBounds.y, box.maxBounds.z)
-        minBounds = SIMD3<Float>(
-            Swift.min(minBounds.x, boxMin.x),
-            Swift.min(minBounds.y, boxMin.y),
-            Swift.min(minBounds.z, boxMin.z)
-        )
-        maxBounds = SIMD3<Float>(
-            Swift.max(maxBounds.x, boxMax.x),
-            Swift.max(maxBounds.y, boxMax.y),
-            Swift.max(maxBounds.z, boxMax.z)
-        )
-    }
-
-    private func normalizationTransform(for positions: [SIMD3<Float>]) -> simd_float4x4 {
-        guard let first = positions.first else {
-            return .identity()
-        }
-
-        var minBounds = first
-        var maxBounds = first
-        for position in positions.dropFirst() {
-            minBounds = SIMD3<Float>(
-                Swift.min(minBounds.x, position.x),
-                Swift.min(minBounds.y, position.y),
-                Swift.min(minBounds.z, position.z)
-            )
-            maxBounds = SIMD3<Float>(
-                Swift.max(maxBounds.x, position.x),
-                Swift.max(maxBounds.y, position.y),
-                Swift.max(maxBounds.z, position.z)
-            )
-        }
-        return normalizationTransform(minBounds: minBounds, maxBounds: maxBounds)
-    }
-
-    private func normalizationTransform(
-        minBounds: SIMD3<Float>,
-        maxBounds: SIMD3<Float>
-    ) -> simd_float4x4 {
-        guard minBounds.x.isFinite,
-              minBounds.y.isFinite,
-              minBounds.z.isFinite,
-              maxBounds.x.isFinite,
-              maxBounds.y.isFinite,
-              maxBounds.z.isFinite else {
-            return .identity()
-        }
-
-        let center = (minBounds + maxBounds) * 0.5
-        let extent = maxBounds - minBounds
-        let radius = Swift.max(extent.x, Swift.max(extent.y, extent.z)) * 0.5
-        guard radius > 0.0001 else {
-            return .identity()
-        }
-
-        return simd_float4x4.scale(SIMD3<Float>(repeating: 1.0 / radius))
-            * simd_float4x4.translation(-center)
-    }
-
     private func texture(named name: String) -> MTLTexture {
-        if let cached = textureCache[name] {
-            return cached
-        }
-
-        guard let url = Bundle.main.textureURL(named: name) else {
-            return fallbackTexture
-        }
-
-        do {
-            let texture = try textureLoader.newTexture(URL: url, options: [
-                MTKTextureLoader.Option.SRGB: true,
-                MTKTextureLoader.Option.generateMipmaps: true,
-            ])
-            textureCache[name] = texture
-            return texture
-        } catch {
-            return fallbackTexture
-        }
+        textureStore.texture(named: name)
     }
 
     private func dataTexture(named name: String) -> MTLTexture {
-        if let cached = dataTextureCache[name] {
-            return cached
-        }
-
-        guard let url = Bundle.main.textureURL(named: name) else {
-            return fallbackTexture
-        }
-
-        do {
-            let texture = try textureLoader.newTexture(URL: url, options: [
-                MTKTextureLoader.Option.SRGB: false,
-                MTKTextureLoader.Option.generateMipmaps: true,
-            ])
-            dataTextureCache[name] = texture
-            return texture
-        } catch {
-            return fallbackTexture
-        }
+        textureStore.dataTexture(named: name)
     }
 
     private func remoteTexture(
@@ -2545,166 +2242,28 @@ final class PlanetRenderer: NSObject, MTKViewDelegate, MetalCameraInputDelegate 
         refreshInterval: TimeInterval,
         at timestamp: CFTimeInterval
     ) -> MTLTexture? {
-        let key = RemoteTextureKey(urlString: urlString, isSRGB: isSRGB, processing: processing)
-        let minimumInterval = max(refreshInterval, 5)
-
-        remoteTextureLock.lock()
-        let entry: RemoteTextureEntry
-        if let cachedEntry = remoteTextureCache[key] {
-            entry = cachedEntry
-        } else {
-            let newEntry = RemoteTextureEntry()
-            remoteTextureCache[key] = newEntry
-            entry = newEntry
-        }
-
-        let cachedTexture = entry.texture
-        let shouldRefresh = !entry.isLoading && timestamp - entry.lastRequestTime >= minimumInterval
-        if shouldRefresh {
-            entry.isLoading = true
-            entry.lastRequestTime = timestamp
-        }
-        remoteTextureLock.unlock()
-
-        if shouldRefresh {
-            refreshRemoteTexture(key: key)
-        }
-
-        return cachedTexture
+        textureStore.remoteTexture(
+            urlString: urlString,
+            isSRGB: isSRGB,
+            processing: processing,
+            refreshInterval: refreshInterval,
+            at: timestamp
+        )
     }
 
-    private func refreshRemoteTexture(key: RemoteTextureKey) {
-        guard let url = URL(string: key.urlString) else {
-            finishRemoteTextureLoad(key: key, texture: nil)
+    private func reportIssue(_ message: String) {
+        reportedIssueLock.lock()
+        let isNewIssue = reportedIssueMessages.insert(message).inserted
+        reportedIssueLock.unlock()
+
+        guard isNewIssue else {
             return
         }
 
-        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
-            guard let self else { return }
-            guard error == nil,
-                  let httpResponse = response as? HTTPURLResponse,
-                  (200..<300).contains(httpResponse.statusCode),
-                  let data else {
-                self.finishRemoteTextureLoad(key: key, texture: nil)
-                return
-            }
-
-            let texture: MTLTexture?
-            switch key.processing {
-            case .cloudDensity:
-                texture = self.makeCloudDensityTexture(from: data)
-            case .raw:
-                texture = try? self.textureLoader.newTexture(data: data, options: [
-                    MTKTextureLoader.Option.SRGB: key.isSRGB,
-                    MTKTextureLoader.Option.generateMipmaps: true,
-                ])
-            }
-
-            self.finishRemoteTextureLoad(key: key, texture: texture)
-        }.resume()
-    }
-
-    /// Decodes image bytes and produces a linear grayscale texture whose value is
-    /// the cloud density. If the source has a varying alpha channel (e.g. the live
-    /// `clouds-alpha.png`, which stores the real cloud mask in alpha), that alpha
-    /// is used; otherwise the luminance is used (e.g. a plain grayscale cloud map).
-    private func makeCloudDensityTexture(from data: Data) -> MTLTexture? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            return nil
+        Self.logger.error("\(message, privacy: .public)")
+        DispatchQueue.main.async { [weak self] in
+            self?.onRendererError?(message)
         }
-
-        let width = cgImage.width
-        let height = cgImage.height
-        guard width > 0, height > 0 else { return nil }
-
-        let pixelCount = width * height
-        let bytesPerRow = width * 4
-        var rgba = [UInt8](repeating: 0, count: pixelCount * 4)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: &rgba,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        // Decide whether the alpha channel carries real information.
-        var alphaMin: UInt8 = 255
-        var alphaMax: UInt8 = 0
-        var sampleIndex = 3
-        let sampleStride = max(1, pixelCount / 100_000) * 4
-        while sampleIndex < rgba.count {
-            let a = rgba[sampleIndex]
-            if a < alphaMin { alphaMin = a }
-            if a > alphaMax { alphaMax = a }
-            sampleIndex += sampleStride
-        }
-        let alphaCarriesMask = Int(alphaMax) - Int(alphaMin) > 8
-
-        // Pack the chosen density channel into a single-channel buffer.
-        var density = [UInt8](repeating: 0, count: pixelCount)
-        for pixelIndex in 0..<pixelCount {
-            let rgbaOffset = pixelIndex * 4
-            if alphaCarriesMask {
-                density[pixelIndex] = rgba[rgbaOffset + 3]
-            } else {
-                // Rec. 601 luma; rgb is un-premultiplied here since alpha == 255.
-                let red = Int(rgba[rgbaOffset])
-                let green = Int(rgba[rgbaOffset + 1])
-                let blue = Int(rgba[rgbaOffset + 2])
-                density[pixelIndex] = UInt8((red * 299 + green * 587 + blue * 114) / 1000)
-            }
-        }
-
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r8Unorm,
-            width: width,
-            height: height,
-            mipmapped: true
-        )
-        descriptor.usage = [.shaderRead]
-        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
-        texture.replace(
-            region: MTLRegionMake2D(0, 0, width, height),
-            mipmapLevel: 0,
-            withBytes: density,
-            bytesPerRow: width
-        )
-        generateMipmaps(for: texture)
-        return texture
-    }
-
-    private func generateMipmaps(for texture: MTLTexture) {
-        guard texture.mipmapLevelCount > 1,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let blit = commandBuffer.makeBlitCommandEncoder() else {
-            return
-        }
-        blit.generateMipmaps(for: texture)
-        blit.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-    }
-
-    private func finishRemoteTextureLoad(key: RemoteTextureKey, texture: MTLTexture?) {
-        remoteTextureLock.lock()
-        defer { remoteTextureLock.unlock() }
-
-        let entry = remoteTextureCache[key] ?? RemoteTextureEntry()
-        if remoteTextureCache[key] == nil {
-            remoteTextureCache[key] = entry
-        }
-        if let texture {
-            entry.texture = texture
-        }
-        entry.isLoading = false
     }
 
     private static func makeFallbackTexture(device: MTLDevice) -> MTLTexture? {

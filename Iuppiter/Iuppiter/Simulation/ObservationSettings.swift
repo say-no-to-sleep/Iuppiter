@@ -21,7 +21,7 @@ enum ObservationMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-struct PlanetariumLocation: Equatable, Sendable {
+struct PlanetariumLocation: Equatable, Hashable, Sendable {
     var name: String
     var latitudeDegrees: Double
     var longitudeDegrees: Double
@@ -47,6 +47,23 @@ struct PlanetariumLocation: Equatable, Sendable {
             latitudeDegrees: min(90, max(-90, latitudeDegrees)),
             longitudeDegrees: min(180, max(-180, longitudeDegrees))
         )
+    }
+}
+
+enum PlanetariumHeading {
+    static func normalizedDegrees(_ degrees: Double) -> Double {
+        var value = degrees.truncatingRemainder(dividingBy: 360)
+        if value < 0 {
+            value += 360
+        }
+        return value
+    }
+
+    static func cardinalDirection(for degrees: Double) -> String {
+        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        let normalized = normalizedDegrees(degrees)
+        let index = Int((normalized / 45.0).rounded()) % directions.count
+        return directions[index]
     }
 }
 

@@ -19,6 +19,8 @@ struct MetalSolarSystemView: NSViewRepresentable {
     let planetariumLocation: PlanetariumLocation
     let isPhotoMode: Bool
     let selectBodyFromViewport: (String?) -> Void
+    let exportPhoto: (Data) -> Void
+    let reportRendererError: (String) -> Void
     let exitPhotoMode: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -42,46 +44,62 @@ struct MetalSolarSystemView: NSViewRepresentable {
         context.coordinator.simulationDateBinding = _simulationDate
         context.coordinator.planetariumHeadingBinding = _planetariumHeadingDegrees
 
-        if let device = view.device,
-           let renderer = PlanetRenderer(device: device, metalView: view) {
-            renderer.viewport = viewport
-            renderer.update(
-                body: selectedBody,
-                cameraDistance: Float(cameraDistance),
-                timeRate: timeRate,
-                isPaused: isPaused,
-                isLiveView: isLiveView,
-                options: options,
-                observationMode: observationMode,
-                planetariumLocation: planetariumLocation,
-                lockedBodyID: lockedBodyID
-            )
-            renderer.jump(to: simulationDate)
-            renderer.onZoom = { newDistance in
-                DispatchQueue.main.async {
-                    context.coordinator.cameraDistanceBinding?.wrappedValue = Double(newDistance)
+        if let device = view.device {
+            do {
+                let renderer = try PlanetRenderer(device: device, metalView: view)
+                renderer.viewport = viewport
+                renderer.update(
+                    body: selectedBody,
+                    cameraDistance: Float(cameraDistance),
+                    timeRate: timeRate,
+                    isPaused: isPaused,
+                    isLiveView: isLiveView,
+                    options: options,
+                    observationMode: observationMode,
+                    planetariumLocation: planetariumLocation,
+                    lockedBodyID: lockedBodyID
+                )
+                renderer.jump(to: simulationDate)
+                renderer.onZoom = { newDistance in
+                    DispatchQueue.main.async {
+                        context.coordinator.cameraDistanceBinding?.wrappedValue = Double(newDistance)
+                    }
                 }
-            }
-            renderer.onSimulationDateChange = { date in
-                DispatchQueue.main.async {
-                    context.coordinator.simulationDateBinding?.wrappedValue = date
+                renderer.onSimulationDateChange = { date in
+                    DispatchQueue.main.async {
+                        context.coordinator.simulationDateBinding?.wrappedValue = date
+                    }
                 }
-            }
-            renderer.onPlanetariumHeadingChange = { headingDegrees in
-                DispatchQueue.main.async {
-                    context.coordinator.planetariumHeadingBinding?.wrappedValue = headingDegrees
+                renderer.onPlanetariumHeadingChange = { headingDegrees in
+                    DispatchQueue.main.async {
+                        context.coordinator.planetariumHeadingBinding?.wrappedValue = headingDegrees
+                    }
                 }
-            }
-            renderer.onBodyPick = { bodyID in
-                DispatchQueue.main.async {
-                    selectBodyFromViewport(bodyID)
+                renderer.onBodyPick = { bodyID in
+                    DispatchQueue.main.async {
+                        selectBodyFromViewport(bodyID)
+                    }
                 }
+                renderer.onPhotoCapture = { data in
+                    DispatchQueue.main.async {
+                        exportPhoto(data)
+                    }
+                }
+                renderer.onRendererError = { message in
+                    DispatchQueue.main.async {
+                        reportRendererError(message)
+                    }
+                }
+                view.delegate = renderer
+                view.cameraDelegate = renderer
+                context.coordinator.renderer = renderer
+                context.coordinator.lastDateSelectionTrigger = dateSelectionTrigger
+                context.coordinator.lastPhotoCaptureTrigger = photoCaptureTrigger
+            } catch {
+                reportRendererError(error.localizedDescription)
             }
-            view.delegate = renderer
-            view.cameraDelegate = renderer
-            context.coordinator.renderer = renderer
-            context.coordinator.lastDateSelectionTrigger = dateSelectionTrigger
-            context.coordinator.lastPhotoCaptureTrigger = photoCaptureTrigger
+        } else {
+            reportRendererError("This Mac does not expose a Metal-capable device.")
         }
 
         return view
@@ -113,6 +131,16 @@ struct MetalSolarSystemView: NSViewRepresentable {
         context.coordinator.renderer?.onBodyPick = { bodyID in
             DispatchQueue.main.async {
                 selectBodyFromViewport(bodyID)
+            }
+        }
+        context.coordinator.renderer?.onPhotoCapture = { data in
+            DispatchQueue.main.async {
+                exportPhoto(data)
+            }
+        }
+        context.coordinator.renderer?.onRendererError = { message in
+            DispatchQueue.main.async {
+                reportRendererError(message)
             }
         }
         
